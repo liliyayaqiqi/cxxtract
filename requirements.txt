@@ -1,0 +1,8 @@
+# Infrastructure dependencies
+pyyaml>=6.0
+qdrant-client>=1.7.0
+neo4j>=5.14.0
+
+# Layer 1: Extraction Engine dependencies
+tree-sitter>=0.21.0
+tree-sitter-cpp>=0.21.0
