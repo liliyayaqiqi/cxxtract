@@ -296,6 +296,131 @@ class TestGenerateRealEmbeddings(unittest.TestCase):
         self.assertEqual(len(sent_texts[0]), MAX_EMBED_CHARS)
 
 
+class TestRetryBehavior(unittest.TestCase):
+    """Test that only transient/network errors trigger retries."""
+
+    @patch("ingestion.embedding._get_openai_client")
+    def test_retries_on_rate_limit_error(self, mock_get_client):
+        """Test that RateLimitError (429) triggers a retry."""
+        import openai
+        from ingestion.embedding import generate_real_embeddings
+
+        mock_data = MagicMock()
+        mock_data.embedding = [0.1] * 16
+
+        mock_response = MagicMock()
+        mock_response.data = [mock_data]
+
+        mock_client = MagicMock()
+        # Fail once with 429, then succeed
+        mock_client.embeddings.create.side_effect = [
+            openai.RateLimitError(
+                message="Rate limit exceeded",
+                response=MagicMock(status_code=429),
+                body=None,
+            ),
+            mock_response,
+        ]
+        mock_get_client.return_value = mock_client
+
+        vecs = generate_real_embeddings(["test"], dimension=16)
+
+        self.assertEqual(len(vecs), 1)
+        self.assertEqual(mock_client.embeddings.create.call_count, 2)
+
+    @patch("ingestion.embedding._get_openai_client")
+    def test_retries_on_internal_server_error(self, mock_get_client):
+        """Test that InternalServerError (5xx) triggers a retry."""
+        import openai
+        from ingestion.embedding import generate_real_embeddings
+
+        mock_data = MagicMock()
+        mock_data.embedding = [0.2] * 16
+
+        mock_response = MagicMock()
+        mock_response.data = [mock_data]
+
+        mock_client = MagicMock()
+        mock_client.embeddings.create.side_effect = [
+            openai.InternalServerError(
+                message="Internal server error",
+                response=MagicMock(status_code=500),
+                body=None,
+            ),
+            mock_response,
+        ]
+        mock_get_client.return_value = mock_client
+
+        vecs = generate_real_embeddings(["test"], dimension=16)
+
+        self.assertEqual(len(vecs), 1)
+        self.assertEqual(mock_client.embeddings.create.call_count, 2)
+
+    @patch("ingestion.embedding._get_openai_client")
+    def test_retries_on_api_connection_error(self, mock_get_client):
+        """Test that APIConnectionError triggers a retry."""
+        import openai
+        from ingestion.embedding import generate_real_embeddings
+
+        mock_data = MagicMock()
+        mock_data.embedding = [0.3] * 16
+
+        mock_response = MagicMock()
+        mock_response.data = [mock_data]
+
+        mock_client = MagicMock()
+        mock_client.embeddings.create.side_effect = [
+            openai.APIConnectionError(request=MagicMock()),
+            mock_response,
+        ]
+        mock_get_client.return_value = mock_client
+
+        vecs = generate_real_embeddings(["test"], dimension=16)
+
+        self.assertEqual(len(vecs), 1)
+        self.assertEqual(mock_client.embeddings.create.call_count, 2)
+
+    @patch("ingestion.embedding._get_openai_client")
+    def test_no_retry_on_authentication_error(self, mock_get_client):
+        """Test that AuthenticationError (401) does NOT retry — fails immediately."""
+        import openai
+        from ingestion.embedding import generate_real_embeddings
+
+        mock_client = MagicMock()
+        mock_client.embeddings.create.side_effect = openai.AuthenticationError(
+            message="Invalid API key",
+            response=MagicMock(status_code=401),
+            body=None,
+        )
+        mock_get_client.return_value = mock_client
+
+        with self.assertRaises(openai.AuthenticationError):
+            generate_real_embeddings(["test"], dimension=16)
+
+        # Should have been called exactly once — no retries
+        self.assertEqual(mock_client.embeddings.create.call_count, 1)
+
+    @patch("ingestion.embedding._get_openai_client")
+    def test_no_retry_on_bad_request_error(self, mock_get_client):
+        """Test that BadRequestError (400) does NOT retry — fails immediately."""
+        import openai
+        from ingestion.embedding import generate_real_embeddings
+
+        mock_client = MagicMock()
+        mock_client.embeddings.create.side_effect = openai.BadRequestError(
+            message="Invalid input",
+            response=MagicMock(status_code=400),
+            body=None,
+        )
+        mock_get_client.return_value = mock_client
+
+        with self.assertRaises(openai.BadRequestError):
+            generate_real_embeddings(["test"], dimension=16)
+
+        # Should have been called exactly once — no retries
+        self.assertEqual(mock_client.embeddings.create.call_count, 1)
+
+
 class TestOpenAIClientSingleton(unittest.TestCase):
     """Test the module-level client initialization."""
 

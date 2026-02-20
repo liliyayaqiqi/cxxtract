@@ -14,8 +14,9 @@ import logging
 import random
 from typing import List
 
+import openai
 from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from ingestion.config import (
     OPENROUTER_API_KEY,
@@ -171,7 +172,19 @@ def generate_mock_embeddings(
 # Real embedding backend (OpenRouter API)
 # ---------------------------------------------------------------------------
 
+# Only retry on transient / network-related errors.
+# Non-retryable errors (AuthenticationError, BadRequestError, etc.)
+# propagate immediately so callers get fast, actionable feedback.
+_RETRYABLE_EXCEPTIONS = (
+    openai.RateLimitError,        # 429 — too many requests
+    openai.APIConnectionError,    # Network unreachable / DNS failure
+    openai.APITimeoutError,       # Request timed out
+    openai.InternalServerError,   # 5xx — transient server-side error
+)
+
+
 @retry(
+    retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
     wait=wait_exponential(
         multiplier=1,
         min=EMBEDDING_RETRY_MIN_WAIT,
@@ -197,7 +210,15 @@ def generate_real_embeddings(
     OpenRouter do not accept it and will return a 400 error.
 
     Retries up to ``EMBEDDING_MAX_RETRIES`` times with exponential
-    back-off on any transient failure (network, 429, 5xx).
+    back-off, but **only** for transient / network-related errors:
+
+    * ``RateLimitError``      (429)
+    * ``APIConnectionError``  (network unreachable / DNS)
+    * ``APITimeoutError``     (request timed out)
+    * ``InternalServerError`` (5xx)
+
+    Non-retryable errors (``AuthenticationError``, ``BadRequestError``,
+    ``PermissionDeniedError``, ``NotFoundError``) propagate immediately.
 
     Args:
         texts: List of input texts.
@@ -209,8 +230,12 @@ def generate_real_embeddings(
 
     Raises:
         ValueError: If ``OPENROUTER_API_KEY`` is not configured.
-        openai.APIError: On non-retryable API errors after exhausting
-                         retries.
+        openai.RateLimitError: After exhausting retries on 429.
+        openai.APIConnectionError: After exhausting retries on network errors.
+        openai.APITimeoutError: After exhausting retries on timeouts.
+        openai.InternalServerError: After exhausting retries on 5xx.
+        openai.AuthenticationError: Immediately on invalid API key (no retry).
+        openai.BadRequestError: Immediately on malformed request (no retry).
     """
     client = _get_openai_client()
 
