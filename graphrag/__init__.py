@@ -29,6 +29,7 @@ from graphrag.query import (
     get_inheritance_tree,
     BlastRadiusResult,
     AffectedEntity,
+    QueryMetadata,
 )
 
 __all__ = [
@@ -53,4 +54,5 @@ __all__ = [
     "get_inheritance_tree",
     "BlastRadiusResult",
     "AffectedEntity",
+    "QueryMetadata",
 ]
