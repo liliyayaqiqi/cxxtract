@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-02-23T03:41:00.542282+00:00",
+  "source_fixtures_dir": "/Users/yaqi.li/testproject_opencode/extraction/tests/fixtures",
+  "scip_fixture_path": "/Users/yaqi.li/testproject_opencode/graphrag/tests/fixtures/basic_graph.scip",
+  "extraction": {
+    "duration_seconds": 0.014655584003776312,
+    "throughput_per_second": 887.0339112143388,
+    "unit": "files_per_second",
+    "count": 13,
+    "extra": {
+      "entities_extracted": 36,
+      "files_failed": 0
+    }
+  },
+  "ingestion": {
+    "duration_seconds": 0.002085709013044834,
+    "throughput_per_second": 17260.317606551067,
+    "unit": "entities_per_second",
+    "count": 36,
+    "extra": {
+      "batches_sent": 1,
+      "errors": 0
+    }
+  },
+  "graph_ingestion": {
+    "duration_seconds": 7.429099059663713e-05,
+    "throughput_per_second": 26921.164786440906,
+    "unit": "edges_per_second",
+    "count": 2,
+    "extra": {
+      "nodes_created": 3,
+      "batches_sent": 5,
+      "errors": 0
+    }
+  }
+}
