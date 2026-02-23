@@ -27,38 +27,34 @@ Example mappings:
 """
 
 import logging
-import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
 from core.uri_contract import create_global_uri, normalize_cpp_entity_name
 from graphrag.config import IGNORED_NAMESPACES, MONITORED_NAMESPACES
+from graphrag.proto import scip_pb2
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SCIP SymbolInformation.Kind enum values (from scip.proto)
+# SCIP SymbolInformation.Kind enum values (source of truth: generated pb2)
 # ---------------------------------------------------------------------------
-# NOTE: scip-clang v0.3.x sets Kind=0 (UnspecifiedKind) for ALL symbols.
-# We therefore use the descriptor suffix as the PRIMARY type discriminator
-# and Kind only as a SECONDARY hint for the rare toolchains that populate it.
-# ---------------------------------------------------------------------------
-SCIP_KIND_UNSPECIFIED = 0
-SCIP_KIND_CLASS = 9        # was 7 in older proto — corrected to scip.proto enum
-SCIP_KIND_STRUCT = 66
-SCIP_KIND_FUNCTION = 21
-SCIP_KIND_METHOD = 31
-SCIP_KIND_CONSTRUCTOR = 11
-SCIP_KIND_NAMESPACE = 38
-SCIP_KIND_VARIABLE = 81
-SCIP_KIND_PARAMETER = 45
-SCIP_KIND_TYPE_PARAMETER = 78
-SCIP_KIND_FIELD = 19
-SCIP_KIND_ENUM = 15
-SCIP_KIND_ENUM_MEMBER = 16
-SCIP_KIND_MACRO = 30
-SCIP_KIND_TYPE_ALIAS = 74
-SCIP_KIND_UNION = 79
+SCIP_KIND_UNSPECIFIED = scip_pb2.SymbolInformation.Kind.UnspecifiedKind
+SCIP_KIND_CLASS = scip_pb2.SymbolInformation.Kind.Class
+SCIP_KIND_STRUCT = scip_pb2.SymbolInformation.Kind.Struct
+SCIP_KIND_FUNCTION = scip_pb2.SymbolInformation.Kind.Function
+SCIP_KIND_METHOD = scip_pb2.SymbolInformation.Kind.Method
+SCIP_KIND_CONSTRUCTOR = scip_pb2.SymbolInformation.Kind.Constructor
+SCIP_KIND_NAMESPACE = scip_pb2.SymbolInformation.Kind.Namespace
+SCIP_KIND_VARIABLE = scip_pb2.SymbolInformation.Kind.Variable
+SCIP_KIND_PARAMETER = scip_pb2.SymbolInformation.Kind.Parameter
+SCIP_KIND_TYPE_PARAMETER = scip_pb2.SymbolInformation.Kind.TypeParameter
+SCIP_KIND_FIELD = scip_pb2.SymbolInformation.Kind.Field
+SCIP_KIND_ENUM = scip_pb2.SymbolInformation.Kind.Enum
+SCIP_KIND_ENUM_MEMBER = scip_pb2.SymbolInformation.Kind.EnumMember
+SCIP_KIND_MACRO = scip_pb2.SymbolInformation.Kind.Macro
+SCIP_KIND_TYPE_ALIAS = scip_pb2.SymbolInformation.Kind.TypeAlias
+SCIP_KIND_UNION = scip_pb2.SymbolInformation.Kind.Union
 
 # ---- Dual-Brain Entity Type Contract ----
 # The Graph DB (Neo4j) MUST use the exact same entity types as the
@@ -108,6 +104,9 @@ class ParsedScipSymbol:
     namespace_parts: list[str]
     entity_type: str                 # "Class", "Struct", "Function"
     entity_name: str                 # Qualified name (e.g., YAML::GraphBuilderAdapter)
+    package_manager: str
+    package_name: str
+    package_version: str
     is_external: bool
     is_local: bool
     is_macro: bool
@@ -147,9 +146,9 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
         return None
     
     scheme = parts[0]           # "cxx"
-    manager = parts[1]          # "."
-    pkg_name = parts[2]         # "."
-    version = parts[3]          # "$"
+    manager = parts[1]          # package manager
+    pkg_name = parts[2]         # package name
+    version = parts[3]          # package version
     descriptor_str = parts[4]   # "YAML/GraphBuilderAdapter#..."
     
     # Skip non-cxx schemes
@@ -272,10 +271,15 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
     # Determine first (top-level) namespace for filtering decisions
     first_ns = namespace_parts[0] if namespace_parts else ""
     
-    # A symbol is "external" if its top-level namespace is NOT in
-    # MONITORED_NAMESPACES.  This covers std::, boost::, __gnu_cxx::,
-    # and any other third-party or system namespace.
-    is_external = first_ns not in MONITORED_NAMESPACES and first_ns != ""
+    # Package-local symbols for scip-clang typically use ". . $".
+    # A symbol is treated as external if either:
+    # 1) it belongs to a non-local package, or
+    # 2) its top namespace is outside MONITORED_NAMESPACES.
+    # This preserves historical "std:: is external" behavior while allowing
+    # monitored cross-repo symbols (non-local package) to become stubs.
+    is_package_local = manager == "." and pkg_name == "."
+    namespace_external = first_ns not in MONITORED_NAMESPACES and first_ns != ""
+    is_external = (not is_package_local) or namespace_external
     
     # Default entity_type if not yet determined
     if entity_type is None:
@@ -296,6 +300,9 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
         namespace_parts=namespace_parts,
         entity_type=entity_type,
         entity_name=normalize_cpp_entity_name(entity_name),
+        package_manager=manager,
+        package_name=pkg_name,
+        package_version=version,
         is_external=is_external,
         is_local=False,
         is_macro=False,
@@ -303,15 +310,19 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
     )
 
 
-def classify_symbol(scip_symbol: str, kind: int = 0) -> SymbolDisposition:
+def classify_symbol(
+    scip_symbol: str,
+    kind: int = 0,
+    is_local_definition: Optional[bool] = None,
+) -> SymbolDisposition:
     """Classify a SCIP symbol as keep, drop, or stub.
     
     Decision tree:
     
     1. Local / macro / file-scope / unparseable -> ``"drop"``
     2. ``first_namespace`` in ``IGNORED_NAMESPACES`` -> ``"drop"``
-    3. ``first_namespace`` in ``MONITORED_NAMESPACES`` and ``is_external``
-       (i.e., definition not in current repo) -> ``"stub"``
+    3. ``first_namespace`` in ``MONITORED_NAMESPACES`` and symbol is NOT
+       local to current index -> ``"stub"``
     4. ``first_namespace`` in ``MONITORED_NAMESPACES`` -> ``"keep"``
     5. Everything else (unknown namespace, no namespace) -> ``"keep"``
        (conservative — let the graph grow; can always prune later)
@@ -325,6 +336,8 @@ def classify_symbol(scip_symbol: str, kind: int = 0) -> SymbolDisposition:
     Args:
         scip_symbol: Raw SCIP symbol string.
         kind: SymbolInformation.Kind enum value.
+        is_local_definition: Whether symbol is known to be defined in the
+            current SCIP index. ``False`` enables cross-repo stub behavior.
         
     Returns:
         ``"keep"``  — ingest as a full node.
@@ -350,8 +363,13 @@ def classify_symbol(scip_symbol: str, kind: int = 0) -> SymbolDisposition:
     if first_ns in IGNORED_NAMESPACES:
         return "drop"
     
-    # Rule 2: MONITORED_NAMESPACES and external -> stub for cross-repo
-    if first_ns in MONITORED_NAMESPACES and parsed.is_external:
+    # Determine local vs external context. Prefer caller-provided index context.
+    local_def = is_local_definition
+    if local_def is None:
+        local_def = not parsed.is_external
+
+    # Rule 2: MONITORED_NAMESPACES and non-local -> stub for cross-repo
+    if first_ns in MONITORED_NAMESPACES and not local_def:
         return "stub"
     
     # Rule 3: MONITORED_NAMESPACES and local -> keep
@@ -430,10 +448,10 @@ def scip_symbol_to_entity_name(scip_symbol: str) -> Optional[str]:
 def is_external_symbol(scip_symbol: str) -> bool:
     """Check if a SCIP symbol refers to an external dependency.
     
-    A symbol is external when its top-level namespace is not in
-    ``MONITORED_NAMESPACES``.  Note that ``IGNORED_NAMESPACES``
-    symbols are also external, but they are **dropped** entirely
-    by ``classify_symbol()`` before reaching the graph.
+    A symbol is external when it belongs to a non-local package or when its
+    top-level namespace is outside ``MONITORED_NAMESPACES``. Note that
+    ``IGNORED_NAMESPACES`` symbols are external as well, but are **dropped**
+    entirely by ``classify_symbol()`` before reaching the graph.
     
     Args:
         scip_symbol: Raw SCIP symbol string.
@@ -445,7 +463,11 @@ def is_external_symbol(scip_symbol: str) -> bool:
     return parsed.is_external if parsed else False
 
 
-def should_drop_symbol(scip_symbol: str, kind: int = 0) -> bool:
+def should_drop_symbol(
+    scip_symbol: str,
+    kind: int = 0,
+    is_local_definition: Optional[bool] = None,
+) -> bool:
     """Quick predicate: should this symbol be silently discarded?
     
     Convenience wrapper around ``classify_symbol()`` for use in
@@ -454,8 +476,13 @@ def should_drop_symbol(scip_symbol: str, kind: int = 0) -> bool:
     Args:
         scip_symbol: Raw SCIP symbol string.
         kind: SymbolInformation.Kind enum value.
+        is_local_definition: Optional index-locality context.
         
     Returns:
         True if the symbol should be discarded from all pipelines.
     """
-    return classify_symbol(scip_symbol, kind) == "drop"
+    return classify_symbol(
+        scip_symbol,
+        kind,
+        is_local_definition=is_local_definition,
+    ) == "drop"

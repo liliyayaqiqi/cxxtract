@@ -86,6 +86,39 @@ def _infer_role_from_symbol_roles(symbol_roles: int) -> str:
     return "CALL"
 
 
+def _occurrence_line_bounds(occ: scip_pb2.Occurrence) -> Optional[tuple[int, int]]:
+    """Extract line bounds from occurrence (preferring enclosing_range)."""
+    range_data = occ.enclosing_range if occ.enclosing_range else occ.range
+    if len(range_data) < 3:
+        return None
+    start_line = range_data[0]
+    end_line = range_data[2] if len(range_data) == 4 else start_line
+    return start_line, end_line
+
+
+def _occurrence_quad_range(occ: scip_pb2.Occurrence) -> Optional[tuple[int, int, int, int]]:
+    """Extract normalized 4-tuple source range from occurrence.range."""
+    if len(occ.range) < 3:
+        return None
+    if len(occ.range) == 4:
+        return (occ.range[0], occ.range[1], occ.range[2], occ.range[3])
+    return (occ.range[0], occ.range[1], occ.range[0], occ.range[2])
+
+
+def _collect_definition_ranges(doc: scip_pb2.Document) -> dict[str, tuple[int, int, int, int]]:
+    """Collect first definition occurrence range for each symbol in a document."""
+    ranges: dict[str, tuple[int, int, int, int]] = {}
+    for occ in doc.occurrences:
+        if not occ.symbol or not (occ.symbol_roles & 0x1):
+            continue
+        if occ.symbol in ranges:
+            continue
+        normalized = _occurrence_quad_range(occ)
+        if normalized is not None:
+            ranges[occ.symbol] = normalized
+    return ranges
+
+
 def _build_enclosing_scope_map(
     doc: scip_pb2.Document,
 ) -> dict[int, str]:
@@ -100,8 +133,9 @@ def _build_enclosing_scope_map(
     Returns:
         Dict mapping line numbers to the SCIP symbol that defines that scope.
     """
-    scope_map: dict[int, str] = {}
-    
+    # line -> (span_width, start_line, symbol)
+    scope_map: dict[int, tuple[int, int, str]] = {}
+
     for occ in doc.occurrences:
         # Check if this is a definition
         is_def = (occ.symbol_roles & 0x1) > 0
@@ -109,27 +143,28 @@ def _build_enclosing_scope_map(
         if not is_def or not occ.symbol:
             continue
         
-        # Determine the range this definition spans
-        # Prefer enclosing_range if available, else use range
-        range_data = occ.enclosing_range if occ.enclosing_range else occ.range
-        
-        if len(range_data) >= 3:
-            start_line = range_data[0]
-            # If 4 elements: [start_line, start_char, end_line, end_char]
-            # If 3 elements: [start_line, start_char, end_char] (same line)
-            if len(range_data) == 4:
-                end_line = range_data[2]
-            else:
-                end_line = start_line
-            
-            # Map all lines in this range to this symbol
-            for line in range(start_line, end_line + 1):
-                # Prefer narrower scopes (inner definitions override outer)
-                # So don't overwrite if already set
-                if line not in scope_map:
-                    scope_map[line] = occ.symbol
-    
-    return scope_map
+        bounds = _occurrence_line_bounds(occ)
+        if bounds is None:
+            continue
+
+        start_line, end_line = bounds
+        span_width = max(0, end_line - start_line)
+
+        # Map lines to the narrowest enclosing definition.
+        # Tie-breaker: later start_line wins (typically deeper nested).
+        for line in range(start_line, end_line + 1):
+            existing = scope_map.get(line)
+            if existing is None:
+                scope_map[line] = (span_width, start_line, occ.symbol)
+                continue
+
+            existing_width, existing_start, _ = existing
+            if span_width < existing_width or (
+                span_width == existing_width and start_line > existing_start
+            ):
+                scope_map[line] = (span_width, start_line, occ.symbol)
+
+    return {line: data[2] for line, data in scope_map.items()}
 
 
 def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
@@ -165,6 +200,13 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
     references: list[ScipReference] = []
     dropped_syms = 0
     dropped_refs = 0
+
+    local_definition_symbols: set[str] = {
+        sym_info.symbol
+        for doc in index.documents
+        for sym_info in doc.symbols
+        if sym_info.symbol and not sym_info.symbol.startswith("local ")
+    }
     
     # Process each document
     for doc in index.documents:
@@ -172,6 +214,7 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
         
         # Build enclosing scope map for this document
         scope_map = _build_enclosing_scope_map(doc)
+        definition_ranges = _collect_definition_ranges(doc)
         
         # Extract symbol definitions
         for sym_info in doc.symbols:
@@ -180,7 +223,11 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
                 continue
             
             # Smart filtering: classify before spending effort on extraction
-            disposition = classify_symbol(sym_info.symbol, sym_info.kind)
+            disposition = classify_symbol(
+                sym_info.symbol,
+                sym_info.kind,
+                is_local_definition=True,
+            )
             if disposition == "drop":
                 dropped_syms += 1
                 continue
@@ -188,7 +235,10 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
             # Extract relationships, filtering targets too
             rels: list[ScipRelationship] = []
             for rel in sym_info.relationships:
-                tgt_disp = classify_symbol(rel.symbol)
+                tgt_disp = classify_symbol(
+                    rel.symbol,
+                    is_local_definition=(rel.symbol in local_definition_symbols),
+                )
                 if tgt_disp == "drop":
                     continue
                 rels.append(
@@ -201,27 +251,7 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
                     )
                 )
             
-            # Find definition range from occurrences
-            def_range: Optional[tuple[int, int, int, int]] = None
-            for occ in doc.occurrences:
-                if occ.symbol == sym_info.symbol and (occ.symbol_roles & 0x1):
-                    # This is a definition occurrence
-                    if len(occ.range) >= 3:
-                        if len(occ.range) == 4:
-                            def_range = (
-                                occ.range[0],
-                                occ.range[1],
-                                occ.range[2],
-                                occ.range[3],
-                            )
-                        else:
-                            def_range = (
-                                occ.range[0],
-                                occ.range[1],
-                                occ.range[0],
-                                occ.range[2],
-                            )
-                    break
+            def_range = definition_ranges.get(sym_info.symbol)
             
             symbols.append(
                 ScipSymbolDef(
@@ -242,20 +272,25 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
                 continue
             
             # Smart filtering: drop references TO ignored namespaces
-            if should_drop_symbol(occ.symbol):
+            if should_drop_symbol(
+                occ.symbol,
+                is_local_definition=(occ.symbol in local_definition_symbols),
+            ):
                 dropped_refs += 1
                 continue
             
             # Also drop references FROM ignored enclosing symbols
-            enclosing_sym = scope_map.get(occ.range[0] if len(occ.range) >= 3 else -1)
-            if enclosing_sym and should_drop_symbol(enclosing_sym):
+            line = occ.range[0] if len(occ.range) >= 3 else -1
+            enclosing_sym = scope_map.get(line)
+            if enclosing_sym and should_drop_symbol(
+                enclosing_sym,
+                is_local_definition=(enclosing_sym in local_definition_symbols),
+            ):
                 dropped_refs += 1
                 continue
             
             # Determine which definition this reference falls within
-            if len(occ.range) >= 3:
-                line = occ.range[0]
-            else:
+            if len(occ.range) < 3:
                 continue
             
             enclosing = scope_map.get(line)

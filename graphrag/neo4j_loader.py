@@ -24,7 +24,6 @@ from graphrag.config import (
 from graphrag.scip_parser import ScipParseResult, ScipSymbolDef, ScipReference
 from graphrag.symbol_mapper import (
     scip_symbol_to_global_uri,
-    is_external_symbol,
     classify_symbol,
     parse_scip_symbol,
 )
@@ -69,6 +68,123 @@ class IngestionStats:
             f"edges={self.edges_created}, batches={self.batches_sent}, "
             f"errors={self.errors})"
         )
+
+
+_TYPE_SYMBOLS = {"Class", "Struct"}
+_IMPLEMENTATION_SRC_TYPES = {"Class", "Struct", "Function"}
+_IMPLEMENTATION_TGT_TYPES = {"Class", "Struct", "Function"}
+_ALLOWED_EDGE_TYPE_PAIRS: dict[str, set[tuple[str, str]]] = {
+    "INHERITS": {
+        ("Class", "Class"),
+        ("Class", "Struct"),
+        ("Struct", "Class"),
+        ("Struct", "Struct"),
+    },
+    "OVERRIDES": {("Function", "Function")},
+    "CALLS": {("Function", "Function")},
+    "USES_TYPE": {
+        ("Function", "Class"),
+        ("Function", "Struct"),
+        ("Class", "Class"),
+        ("Class", "Struct"),
+        ("Struct", "Class"),
+        ("Struct", "Struct"),
+    },
+}
+
+
+def _infer_implementation_edge_type(
+    src_symbol: str,
+    src_kind: int,
+    target_symbol: str,
+    target_kind: int,
+) -> Optional[str]:
+    """Map SCIP implementation relationships to graph edge types."""
+    parsed_src = parse_scip_symbol(src_symbol, src_kind)
+    parsed_tgt = parse_scip_symbol(target_symbol, target_kind)
+    if parsed_src is None or parsed_tgt is None:
+        return None
+    if parsed_src.entity_type not in _IMPLEMENTATION_SRC_TYPES:
+        return None
+    if parsed_tgt.entity_type not in _IMPLEMENTATION_TGT_TYPES:
+        return None
+
+    if parsed_src.entity_type == "Function" and parsed_tgt.entity_type == "Function":
+        return "OVERRIDES"
+    if parsed_src.entity_type in _TYPE_SYMBOLS and parsed_tgt.entity_type in _TYPE_SYMBOLS:
+        return "INHERITS"
+    return None
+
+
+def _infer_reference_edge_type(
+    src_entity_type: str,
+    tgt_entity_type: str,
+    role: str,
+) -> Optional[str]:
+    """Map reference occurrences to graph edge types."""
+    if role not in {"CALL", "READ", "WRITE"}:
+        return None
+    if tgt_entity_type in _TYPE_SYMBOLS:
+        return "USES_TYPE"
+    if src_entity_type == "Function" and tgt_entity_type == "Function":
+        return "CALLS"
+    return None
+
+
+def _dedupe_nodes(nodes: list[GraphNode]) -> list[GraphNode]:
+    """Deduplicate nodes by URI, preferring local definition over stub."""
+    by_uri: dict[str, GraphNode] = {}
+    for node in nodes:
+        existing = by_uri.get(node.global_uri)
+        if existing is None:
+            by_uri[node.global_uri] = node
+            continue
+        if existing.is_external and not node.is_external:
+            by_uri[node.global_uri] = node
+    return list(by_uri.values())
+
+
+def _dedupe_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
+    """Deduplicate edges by (src, target, relationship type)."""
+    by_key: dict[tuple[str, str, str], GraphEdge] = {}
+    for edge in edges:
+        key = (edge.src_uri, edge.tgt_uri, edge.relationship_type)
+        if key not in by_key:
+            by_key[key] = edge
+    return list(by_key.values())
+
+
+def _validate_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
+    """Drop edges that violate ingestion invariants."""
+    valid: list[GraphEdge] = []
+    for edge in edges:
+        try:
+            src = parse_global_uri(edge.src_uri)
+            tgt = parse_global_uri(edge.tgt_uri)
+        except ValueError:
+            logger.debug(f"Dropping edge with malformed URI: {edge}")
+            continue
+
+        src_type = src["entity_type"]
+        tgt_type = tgt["entity_type"]
+
+        if edge.relationship_type == "CALLS" and src_type == "File":
+            logger.debug(f"Dropping invalid CALLS edge from File node: {edge}")
+            continue
+
+        allowed_pairs = _ALLOWED_EDGE_TYPE_PAIRS.get(edge.relationship_type)
+        if allowed_pairs is not None and (src_type, tgt_type) not in allowed_pairs:
+            logger.debug(
+                "Dropping impossible edge type pair %s(%s -> %s): %s",
+                edge.relationship_type,
+                src_type,
+                tgt_type,
+                edge,
+            )
+            continue
+
+        valid.append(edge)
+    return valid
 
 
 def get_neo4j_driver() -> Driver:
@@ -242,6 +358,7 @@ def _build_edges_from_relationships(
     repo_name: str,
     stub_nodes: list[GraphNode],
     symbol_file_map: dict[str, str],
+    symbol_kind_map: dict[str, int],
 ) -> list[GraphEdge]:
     """Extract edges from SCIP symbol relationships.
     
@@ -260,6 +377,7 @@ def _build_edges_from_relationships(
         symbol_file_map: Lookup from SCIP symbol string to its definition
             file (``Document.relative_path``).  Used to resolve the correct
             file_path for relationship targets.
+        symbol_kind_map: Lookup from SCIP symbol string to Kind enum.
         
     Returns:
         List of GraphEdge objects.
@@ -279,8 +397,13 @@ def _build_edges_from_relationships(
             continue
         
         for rel in sym.relationships:
+            tgt_kind = symbol_kind_map.get(rel.target_symbol, 0)
             # Classify the target symbol
-            tgt_disposition = classify_symbol(rel.target_symbol)
+            tgt_disposition = classify_symbol(
+                rel.target_symbol,
+                kind=tgt_kind,
+                is_local_definition=(rel.target_symbol in symbol_file_map),
+            )
             
             if tgt_disposition == "drop":
                 continue
@@ -299,7 +422,7 @@ def _build_edges_from_relationships(
                 rel.target_symbol,
                 tgt_file_path,
                 repo_name,
-                kind=0,
+                kind=tgt_kind,
             )
             
             if tgt_uri is None:
@@ -309,7 +432,7 @@ def _build_edges_from_relationships(
             if tgt_disposition == "stub" and tgt_uri not in seen_stubs:
                 seen_stubs.add(tgt_uri)
                 
-                parsed_tgt = parse_scip_symbol(rel.target_symbol)
+                parsed_tgt = parse_scip_symbol(rel.target_symbol, tgt_kind)
                 if parsed_tgt:
                     stub_nodes.append(
                         GraphNode(
@@ -325,22 +448,30 @@ def _build_edges_from_relationships(
             
             # Determine relationship type
             if rel.is_implementation:
-                # Heuristic: if symbol contains # but no method (.),
-                # it's class inheritance
-                if "#" in sym.scip_symbol and "()" not in sym.scip_symbol:
-                    rel_type = "INHERITS"
-                else:
-                    rel_type = "OVERRIDES"
-                
-                edges.append(
-                    GraphEdge(
-                        src_uri=src_uri,
-                        tgt_uri=tgt_uri,
-                        relationship_type=rel_type,
-                    )
+                rel_type = _infer_implementation_edge_type(
+                    src_symbol=sym.scip_symbol,
+                    src_kind=sym.kind,
+                    target_symbol=rel.target_symbol,
+                    target_kind=tgt_kind,
                 )
+                if rel_type is not None:
+                    edges.append(
+                        GraphEdge(
+                            src_uri=src_uri,
+                            tgt_uri=tgt_uri,
+                            relationship_type=rel_type,
+                        )
+                    )
             
             if rel.is_type_definition:
+                parsed_src = parse_scip_symbol(sym.scip_symbol, sym.kind)
+                parsed_tgt = parse_scip_symbol(rel.target_symbol, tgt_kind)
+                if parsed_src is None or parsed_tgt is None:
+                    continue
+                if parsed_tgt.entity_type not in _TYPE_SYMBOLS:
+                    continue
+                if parsed_src.entity_type not in _IMPLEMENTATION_SRC_TYPES:
+                    continue
                 edges.append(
                     GraphEdge(
                         src_uri=src_uri,
@@ -357,6 +488,7 @@ def _build_edges_from_references(
     repo_name: str,
     stub_nodes: list[GraphNode],
     symbol_file_map: dict[str, str],
+    symbol_kind_map: dict[str, int],
 ) -> list[GraphEdge]:
     """Extract CALLS edges from reference occurrences.
     
@@ -373,6 +505,7 @@ def _build_edges_from_references(
         symbol_file_map: Lookup from SCIP symbol string to its definition
             file.  Used to resolve correct file_path for both the
             enclosing (source) and referenced (target) symbols.
+        symbol_kind_map: Lookup from SCIP symbol string to Kind enum.
         
     Returns:
         List of GraphEdge objects for CALLS relationships.
@@ -397,13 +530,19 @@ def _build_edges_from_references(
             ref.enclosing_symbol,
             enclosing_file,
             repo_name,
+            kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
         )
         
         if src_uri is None:
             continue
         
         # Classify the target
-        tgt_disposition = classify_symbol(ref.scip_symbol)
+        tgt_kind = symbol_kind_map.get(ref.scip_symbol, 0)
+        tgt_disposition = classify_symbol(
+            ref.scip_symbol,
+            kind=tgt_kind,
+            is_local_definition=(ref.scip_symbol in symbol_file_map),
+        )
         if tgt_disposition == "drop":
             continue
         
@@ -419,6 +558,7 @@ def _build_edges_from_references(
             ref.scip_symbol,
             tgt_file,
             repo_name,
+            kind=tgt_kind,
         )
         
         if tgt_uri is None:
@@ -428,7 +568,7 @@ def _build_edges_from_references(
         if tgt_disposition == "stub" and tgt_uri not in seen_stubs:
             seen_stubs.add(tgt_uri)
             
-            parsed_tgt = parse_scip_symbol(ref.scip_symbol)
+            parsed_tgt = parse_scip_symbol(ref.scip_symbol, tgt_kind)
             if parsed_tgt:
                 stub_nodes.append(
                     GraphNode(
@@ -442,14 +582,19 @@ def _build_edges_from_references(
                     )
                 )
         
-        # Determine edge type based on role and target type
-        if ref.role in ("CALL", "READ"):
-            # Check if target is a type or function
-            if "::Class::" in tgt_uri or "::Struct::" in tgt_uri:
-                rel_type = "USES_TYPE"
-            else:
-                rel_type = "CALLS"
-        else:
+        parsed_src = parse_scip_symbol(
+            ref.enclosing_symbol,
+            kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
+        )
+        parsed_tgt = parse_scip_symbol(ref.scip_symbol, kind=tgt_kind)
+        if parsed_src is None or parsed_tgt is None:
+            continue
+        rel_type = _infer_reference_edge_type(
+            src_entity_type=parsed_src.entity_type,
+            tgt_entity_type=parsed_tgt.entity_type,
+            role=ref.role,
+        )
+        if rel_type is None:
             continue
         
         edges.append(
@@ -499,22 +644,38 @@ def ingest_graph(
         sym.scip_symbol: sym.file_path
         for sym in parse_result.symbols
     }
+    symbol_kind_map: dict[str, int] = {
+        sym.scip_symbol: sym.kind
+        for sym in parse_result.symbols
+    }
     
     # Build nodes and edges (stub_nodes accumulates cross-repo placeholders)
     stub_nodes: list[GraphNode] = []
     nodes = _build_nodes_from_symbols(parse_result.symbols, repo_name)
     rel_edges = _build_edges_from_relationships(
-        parse_result.symbols, repo_name, stub_nodes, symbol_file_map,
+        parse_result.symbols,
+        repo_name,
+        stub_nodes,
+        symbol_file_map,
+        symbol_kind_map,
     )
     ref_edges = _build_edges_from_references(
-        parse_result.references, repo_name, stub_nodes, symbol_file_map,
+        parse_result.references,
+        repo_name,
+        stub_nodes,
+        symbol_file_map,
+        symbol_kind_map,
     )
     
-    all_edges = rel_edges + ref_edges
-    all_nodes = nodes + stub_nodes
+    all_nodes_raw = nodes + stub_nodes
+    all_edges_raw = rel_edges + ref_edges
+    all_nodes = _dedupe_nodes(all_nodes_raw)
+    deduped_edges = _dedupe_edges(all_edges_raw)
+    all_edges = _validate_edges(deduped_edges)
     
     logger.info(
-        f"Prepared {len(nodes)} local nodes + {len(stub_nodes)} stub nodes, "
+        f"Prepared {len(nodes)} local nodes + {len(stub_nodes)} stub nodes "
+        f"(deduped to {len(all_nodes)}), "
         f"{len(all_edges)} edges "
         f"({len(rel_edges)} from relationships, {len(ref_edges)} from references)"
     )

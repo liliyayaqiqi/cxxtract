@@ -423,26 +423,35 @@ class TestShouldDropSymbol(unittest.TestCase):
 class TestCrossRepoStubClassification(unittest.TestCase):
     """Test classify_symbol behaviour for cross-repo stub scenarios.
     
-    When a MONITORED namespace symbol is marked is_external (its definition
-    lives in another repo), classify_symbol should return "stub".
+    classify_symbol uses explicit local-definition context to distinguish
+    local definitions from cross-repo references in monitored namespaces.
     """
     
     def test_monitored_but_external_is_stub(self):
-        """Test that a monitored-namespace symbol that is external becomes stub.
-        
-        parse_scip_symbol sets is_external based on whether the first_namespace
-        is NOT in MONITORED_NAMESPACES. Since YAML IS monitored, is_external=False
-        and the result is "keep" (it's a local definition).
-        
-        A symbol from a sibling repo like webrtc is monitored AND the definition
-        won't be in the local index. The classification in the edge builder
-        will correctly produce "stub" because parse_scip_symbol recognises
-        the namespace is monitored but the caller knows it's external.
-        """
-        # YAML is monitored, defined in current repo -> keep
+        """Monitored symbol from non-local package should classify as stub."""
         self.assertEqual(
-            classify_symbol("cxx . . $ YAML/Node#"),
+            classify_symbol("cxx cargo sibling v1.0.0 webrtc/RtpSender#"),
+            "stub",
+        )
+
+    def test_monitored_symbol_local_override_keeps(self):
+        """Explicit local-definition context should force keep for monitored symbols."""
+        self.assertEqual(
+            classify_symbol(
+                "cxx cargo sibling v1.0.0 webrtc/RtpSender#",
+                is_local_definition=True,
+            ),
             "keep",
+        )
+
+    def test_monitored_symbol_nonlocal_override_stubs(self):
+        """Explicit non-local context should produce stub for monitored symbols."""
+        self.assertEqual(
+            classify_symbol(
+                "cxx . . $ webrtc/RtpSender#",
+                is_local_definition=False,
+            ),
+            "stub",
         )
     
     def test_unknown_external_not_in_ignore_keeps(self):

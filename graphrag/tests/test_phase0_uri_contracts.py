@@ -60,9 +60,8 @@ class TestUriContractEquivalencePhase0(unittest.TestCase):
         )
         self.assertEqual(extraction_uri, scip_uri)
 
-    @unittest.expectedFailure
     def test_struct_kind_from_proto_enum_should_map_to_struct(self) -> None:
-        """Known bug gate: protobuf Struct kind should map to entity_type Struct."""
+        """Protobuf Struct kind should map to entity_type Struct."""
         parsed = parse_scip_symbol(
             scip_symbol="cxx . . $ YAML/Node#",
             kind=scip_pb2.SymbolInformation.Kind.Struct,
@@ -70,9 +69,8 @@ class TestUriContractEquivalencePhase0(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.entity_type, "Struct")
 
-    @unittest.expectedFailure
     def test_monitored_external_symbol_should_classify_as_stub(self) -> None:
-        """Known bug gate: monitored namespace from external package should be stub."""
+        """Monitored namespace from external package should classify as stub."""
         # This carries a non-local package section and a monitored namespace.
         symbol = "cxx cargo sibling-repo v1.0.0 webrtc/RtpSender#"
         self.assertEqual(classify_symbol(symbol, kind=0), "stub")

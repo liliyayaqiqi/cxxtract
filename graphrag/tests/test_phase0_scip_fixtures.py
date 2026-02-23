@@ -39,13 +39,8 @@ class TestScipFixtureParsingPhase0(unittest.TestCase):
         self.assertEqual(symbols_1, symbols_2)
         self.assertEqual(refs_1, refs_2)
 
-    @unittest.expectedFailure
     def test_nested_scope_reference_should_bind_to_innermost_scope(self) -> None:
-        """Known bug gate: reference in inner function should bind to inner symbol.
-
-        Current implementation in _build_enclosing_scope_map uses first-write-wins,
-        so this test is expected to fail until the scope attribution logic is fixed.
-        """
+        """Reference in inner function should bind to innermost symbol."""
         result = parse_scip_index(str(NESTED_FIXTURE), repo_name="phase0")
         self.assertEqual(len(result.references), 1)
         self.assertEqual(result.references[0].enclosing_symbol, "cxx . . $ YAML/inner(bbbb).")
