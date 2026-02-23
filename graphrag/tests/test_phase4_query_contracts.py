@@ -66,11 +66,46 @@ class TestPhase4BlastRadiusContract(unittest.TestCase):
         self.assertEqual(result.metadata.status, "missing_root")
         self.assertEqual(result.total_count, 0)
 
+    def test_ambiguous_global_uri_returns_candidates(self) -> None:
+        driver = _FakeDriver(
+            responses=[
+                [
+                    {
+                        "node_id": "n1",
+                        "identity_key": "repo::f.cpp::Function::run::sig_a1",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    },
+                    {
+                        "node_id": "n2",
+                        "identity_key": "repo::f.cpp::Function::run::sig_b2",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    },
+                ],
+            ]
+        )
+        result = calculate_blast_radius("repo::f.cpp::Function::run", driver)
+        self.assertEqual(result.metadata.status, "ambiguous_root")
+        self.assertEqual(result.metadata.reason, "ambiguous_global_uri")
+        self.assertEqual(
+            result.metadata.ambiguous_candidates,
+            [
+                "repo::f.cpp::Function::run::sig_a1",
+                "repo::f.cpp::Function::run::sig_b2",
+            ],
+        )
+        self.assertEqual(result.total_count, 0)
+
     def test_empty_result_returns_typed_status(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],  # root lookup
-                [],  # blast query
+                [
+                    {
+                        "node_id": "root",
+                        "identity_key": "repo::f.cpp::Function::run::sig_0",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    }
+                ],  # root lookup
+                [],  # BFS expansion depth 1
             ]
         )
         result = calculate_blast_radius("repo::f.cpp::Function::run", driver)
@@ -79,65 +114,136 @@ class TestPhase4BlastRadiusContract(unittest.TestCase):
         self.assertEqual(result.total_count, 0)
 
     def test_pagination_sets_next_cursor_and_parses_cursor(self) -> None:
-        records = [
-            {
-                "uri": "repo::a.cpp::Function::A",
-                "type": "Function",
-                "name": "A",
-                "file": "a.cpp",
-                "depth": 1,
-                "chain": ["CALLS"],
-            },
-            {
-                "uri": "repo::b.cpp::Function::B",
-                "type": "Function",
-                "name": "B",
-                "file": "b.cpp",
-                "depth": 2,
-                "chain": ["CALLS", "CALLS"],
-            },
-            {
-                "uri": "repo::c.cpp::Function::C",
-                "type": "Function",
-                "name": "C",
-                "file": "c.cpp",
-                "depth": 3,
-                "chain": ["CALLS", "CALLS", "CALLS"],
-            },
-        ]
         driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],
-                records,
+                [
+                    {
+                        "node_id": "root",
+                        "identity_key": "repo::f.cpp::Function::run::sig_0",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    }
+                ],
+                [
+                    {
+                        "node_id": "na",
+                        "identity_key": "repo::a.cpp::Function::A",
+                        "uri": "repo::a.cpp::Function::A",
+                        "scip_symbol": "a",
+                        "type": "Function",
+                        "name": "A",
+                        "file": "a.cpp",
+                        "repo_name": "repo",
+                    }
+                ],
+                [
+                    {
+                        "node_id": "nb",
+                        "identity_key": "repo::b.cpp::Function::B",
+                        "uri": "repo::b.cpp::Function::B",
+                        "scip_symbol": "b",
+                        "type": "Function",
+                        "name": "B",
+                        "file": "b.cpp",
+                        "repo_name": "repo",
+                    },
+                    {
+                        "node_id": "nc",
+                        "identity_key": "repo::c.cpp::Function::C",
+                        "uri": "repo::c.cpp::Function::C",
+                        "scip_symbol": "c",
+                        "type": "Function",
+                        "name": "C",
+                        "file": "c.cpp",
+                        "repo_name": "repo",
+                    },
+                ],
+                [
+                    {"node_id": "na", "chain": ["CALLS"]},
+                    {"node_id": "nb", "chain": ["CALLS", "CALLS"]},
+                ],
             ]
         )
         first_page = calculate_blast_radius(
             "repo::f.cpp::Function::run",
             driver,
             max_results=2,
+            max_depth=2,
         )
         self.assertEqual(first_page.total_count, 2)
         self.assertEqual(first_page.metadata.next_cursor, "2|repo::b.cpp::Function::B")
+        self.assertEqual(first_page.affected_entities[0].relationship_chain, ["CALLS"])
+        self.assertEqual(first_page.affected_entities[1].relationship_chain, ["CALLS", "CALLS"])
+        self.assertIn("UNWIND $frontier", driver.calls[1]["query"])
+        self.assertNotIn("MATCH path =", driver.calls[1]["query"])
+        self.assertIn("shortestPath(", driver.calls[3]["query"])
 
         cursor_driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],
-                [],
+                [
+                    {
+                        "node_id": "root",
+                        "identity_key": "repo::f.cpp::Function::run::sig_0",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    }
+                ],
+                [
+                    {
+                        "node_id": "na",
+                        "identity_key": "repo::a.cpp::Function::A",
+                        "uri": "repo::a.cpp::Function::A",
+                        "scip_symbol": "a",
+                        "type": "Function",
+                        "name": "A",
+                        "file": "a.cpp",
+                        "repo_name": "repo",
+                    }
+                ],
+                [
+                    {
+                        "node_id": "nb",
+                        "identity_key": "repo::b.cpp::Function::B",
+                        "uri": "repo::b.cpp::Function::B",
+                        "scip_symbol": "b",
+                        "type": "Function",
+                        "name": "B",
+                        "file": "b.cpp",
+                        "repo_name": "repo",
+                    },
+                    {
+                        "node_id": "nc",
+                        "identity_key": "repo::c.cpp::Function::C",
+                        "uri": "repo::c.cpp::Function::C",
+                        "scip_symbol": "c",
+                        "type": "Function",
+                        "name": "C",
+                        "file": "c.cpp",
+                        "repo_name": "repo",
+                    },
+                ],
+                [
+                    {"node_id": "nc", "chain": ["CALLS", "CALLS"]},
+                ],
             ]
         )
-        calculate_blast_radius(
+        next_page = calculate_blast_radius(
             "repo::f.cpp::Function::run",
             cursor_driver,
             cursor=first_page.metadata.next_cursor,
+            max_depth=2,
         )
-        blast_call_params = cursor_driver.calls[1]["params"]
-        self.assertEqual(blast_call_params["cursor_depth"], 2)
-        self.assertEqual(blast_call_params["cursor_uri"], "repo::b.cpp::Function::B")
+        self.assertEqual(next_page.total_count, 1)
+        self.assertEqual(next_page.affected_entities[0].identity_key, "repo::c.cpp::Function::C")
 
     def test_identity_key_selector_is_supported(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],
+                [
+                    {
+                        "node_id": "root",
+                        "identity_key": "repo::f.cpp::Function::run::sig_deadbeef",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    }
+                ],
                 [],
             ]
         )
@@ -156,7 +262,13 @@ class TestPhase4BlastRadiusContract(unittest.TestCase):
     def test_scip_symbol_selector_is_supported(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],
+                [
+                    {
+                        "node_id": "root",
+                        "identity_key": "repo::f.cpp::Function::run::sig_deadbeef",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    }
+                ],
                 [],
             ]
         )
@@ -193,7 +305,7 @@ class TestPhase4NeighborContract(unittest.TestCase):
     def test_neighbors_default_to_entity_only(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],  # root
+                [{"node_id": "root", "identity_key": "repo::f.cpp::Function::run", "global_uri": "repo::f.cpp::Function::run"}],  # root
                 [{"identity_key": "repo::a.cpp::Function::A", "uri": "repo::a.cpp::Function::A", "type": "Function", "relationship": "CALLS"}],
                 [{"identity_key": "repo::b.h::Class::B", "uri": "repo::b.h::Class::B", "type": "Class", "relationship": "USES_TYPE"}],
             ]
@@ -208,7 +320,7 @@ class TestPhase4NeighborContract(unittest.TestCase):
     def test_neighbors_can_include_non_entity_nodes(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],
+                [{"node_id": "root", "identity_key": "repo::f.cpp::Function::run", "global_uri": "repo::f.cpp::Function::run"}],
                 [],
                 [],
             ]
@@ -228,6 +340,35 @@ class TestPhase4NeighborContract(unittest.TestCase):
         self.assertEqual(result["inbound"], [])
         self.assertEqual(result["outbound"], [])
 
+    def test_neighbors_ambiguous_root_returns_candidates(self) -> None:
+        driver = _FakeDriver(
+            responses=[
+                [
+                    {
+                        "node_id": "n1",
+                        "identity_key": "repo::f.cpp::Function::run::sig_a1",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    },
+                    {
+                        "node_id": "n2",
+                        "identity_key": "repo::f.cpp::Function::run::sig_b2",
+                        "global_uri": "repo::f.cpp::Function::run",
+                    },
+                ],
+            ]
+        )
+        result = get_entity_neighbors("repo::f.cpp::Function::run", driver)
+        self.assertEqual(result["metadata"].status, "ambiguous_root")
+        self.assertEqual(
+            result["metadata"].ambiguous_candidates,
+            [
+                "repo::f.cpp::Function::run::sig_a1",
+                "repo::f.cpp::Function::run::sig_b2",
+            ],
+        )
+        self.assertEqual(result["inbound"], [])
+        self.assertEqual(result["outbound"], [])
+
 
 class TestPhase4InheritanceContract(unittest.TestCase):
     def test_inheritance_missing_root_returns_status(self) -> None:
@@ -240,7 +381,7 @@ class TestPhase4InheritanceContract(unittest.TestCase):
     def test_inheritance_queries_use_deterministic_order(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"root_count": 1}],  # root
+                [{"node_id": "root", "identity_key": "repo::x.h::Class::Node", "global_uri": "repo::x.h::Class::Node"}],  # root
                 [{"uri": "repo::a.h::Class::Base", "identity_key": "repo::a.h::Class::Base"}],  # ancestors
                 [{"uri": "repo::z.h::Class::Derived", "identity_key": "repo::z.h::Class::Derived"}],  # descendants
             ]

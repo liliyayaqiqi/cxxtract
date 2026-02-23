@@ -27,8 +27,9 @@ DEFAULT_BLAST_RELATIONSHIP_TYPES = (
 class QueryMetadata:
     """Typed metadata describing query outcome and pagination."""
 
-    status: Literal["ok", "missing_root", "empty_result"] = "ok"
+    status: Literal["ok", "missing_root", "empty_result", "ambiguous_root"] = "ok"
     reason: str = ""
+    ambiguous_candidates: list[str] = field(default_factory=list)
     next_cursor: Optional[str] = None
     query_timeout_s: float = DEFAULT_QUERY_TIMEOUT_S
 
@@ -101,7 +102,7 @@ def _resolve_entity_selector(
     scip_symbol: Optional[str],
     owner_repo: Optional[str],
     global_uri: Optional[str],
-) -> tuple[str, dict[str, object], str]:
+) -> tuple[str, dict[str, object], str, str]:
     """Build Cypher predicate/params for selecting root entities.
 
     Selection precedence:
@@ -124,6 +125,7 @@ def _resolve_entity_selector(
             "start.identity_key = $entity_id",
             {"entity_id": identity_key},
             identity_key,
+            "identity_key",
         )
 
     if scip_symbol is not None:
@@ -135,7 +137,7 @@ def _resolve_entity_selector(
             origin = f"{owner_repo}:{scip_symbol}"
         else:
             origin = scip_symbol
-        return predicate, params, origin
+        return predicate, params, origin, "scip_symbol"
 
     if global_uri is not None:
         # global_uri is a symbol-family identifier and may correspond to
@@ -144,9 +146,80 @@ def _resolve_entity_selector(
             "start.global_uri = $global_uri",
             {"global_uri": global_uri},
             global_uri,
+            "global_uri",
         )
 
     raise ValueError("One of identity_key, scip_symbol, or global_uri is required")
+
+
+def _resolve_root_node(
+    *,
+    driver: Driver,
+    selector_predicate: str,
+    selector_params: dict[str, object],
+    selector_type: str,
+    repo_name: Optional[str],
+    metadata: QueryMetadata,
+    query_timeout_s: float,
+) -> Optional[dict[str, str]]:
+    """Resolve a unique root node or annotate metadata with an error state."""
+    with driver.session() as session:
+        records = list(
+            session.run(
+                Query(
+                    f"""
+                    MATCH (start:Entity)
+                    WHERE {selector_predicate}
+                      AND ($repo_name IS NULL OR start.repo_name = $repo_name)
+                    RETURN
+                        elementId(start) AS node_id,
+                        start.identity_key AS identity_key,
+                        start.global_uri AS global_uri
+                    ORDER BY identity_key ASC, global_uri ASC
+                    """,
+                    timeout=query_timeout_s,
+                ),
+                **selector_params,
+                repo_name=repo_name,
+            )
+        )
+
+    if not records:
+        metadata.status = "missing_root"
+        metadata.reason = "origin_not_found"
+        return None
+
+    if len(records) > 1:
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for rec in records:
+            candidate = rec.get("identity_key") or rec.get("global_uri")
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+        candidates.sort()
+        metadata.status = "ambiguous_root"
+        metadata.reason = f"ambiguous_{selector_type}"
+        metadata.ambiguous_candidates = candidates
+        return None
+
+    return {
+        "node_id": records[0]["node_id"],
+        "identity_key": records[0].get("identity_key") or records[0]["global_uri"],
+        "global_uri": records[0]["global_uri"],
+    }
+
+
+def _build_shortest_path_pattern(
+    direction: Literal["upstream", "downstream"],
+    rel_types: Sequence[str],
+    max_depth: int,
+) -> str:
+    rel_expr = "|".join(rel_types)
+    if direction == "upstream":
+        return f"(start)<-[:{rel_expr}*1..{max_depth}]-(target)"
+    return f"(start)-[:{rel_expr}*1..{max_depth}]->(target)"
 
 
 def calculate_blast_radius(
@@ -172,8 +245,9 @@ def calculate_blast_radius(
     **Downstream** (direction="downstream"): What does this entity depend on?
     Returns all entities that the given entity depends on (callees, base classes, etc.).
     
-    Uses variable-length path traversal with configurable depth limit.
-    Leverages Neo4j's index-free adjacency for O(1) edge traversal.
+    Uses a two-phase traversal strategy:
+    1) bounded BFS expansion to find distinct affected nodes + min depth
+    2) shortestPath reconstruction only for the returned page
     
     Args:
         global_uri: Legacy selector. Represents a symbol family, not always a
@@ -207,7 +281,7 @@ def calculate_blast_radius(
     if driver is None:
         raise ValueError("driver is required")
 
-    selector_predicate, selector_params, origin_id = _resolve_entity_selector(
+    selector_predicate, selector_params, origin_id, selector_type = _resolve_entity_selector(
         identity_key=identity_key,
         scip_symbol=scip_symbol,
         owner_repo=owner_repo,
@@ -236,104 +310,170 @@ def calculate_blast_radius(
         metadata=QueryMetadata(query_timeout_s=query_timeout_s),
     )
 
-    with driver.session() as session:
-        root_query = Query(
-            f"""
-            MATCH (start:Entity)
-            WHERE {selector_predicate}
-              AND ($repo_name IS NULL OR start.repo_name = $repo_name)
-            RETURN count(start) AS root_count
+    root_node = _resolve_root_node(
+        driver=driver,
+        selector_predicate=selector_predicate,
+        selector_params=selector_params,
+        selector_type=selector_type,
+        repo_name=repo_name,
+        metadata=result.metadata,
+        query_timeout_s=query_timeout_s,
+    )
+    if root_node is None:
+        return result
+
+    if not rel_types:
+        result.metadata.status = "empty_result"
+        result.metadata.reason = "no_relationship_types_requested"
+        return result
+
+    if direction == "upstream":
+        expand_query = Query(
+            """
+            UNWIND $frontier AS frontier_node_id
+            MATCH (frontier:Entity)
+            WHERE elementId(frontier) = frontier_node_id
+            MATCH (affected:Entity)-[r]->(frontier)
+            WHERE type(r) IN $rel_types
+            RETURN DISTINCT
+                elementId(affected) AS node_id,
+                affected.identity_key AS identity_key,
+                affected.global_uri AS uri,
+                affected.scip_symbol AS scip_symbol,
+                affected.entity_type AS type,
+                affected.entity_name AS name,
+                affected.file_path AS file,
+                affected.repo_name AS repo_name
             """,
             timeout=query_timeout_s,
         )
-        root_record = session.run(
-            root_query,
-            **selector_params,
-            repo_name=repo_name,
-        ).single()
-        if root_record is None or root_record["root_count"] == 0:
-            result.metadata.status = "missing_root"
-            result.metadata.reason = "origin_not_found"
-            return result
-
-        if not rel_types:
-            result.metadata.status = "empty_result"
-            result.metadata.reason = "no_relationship_types_requested"
-            return result
-    
-    if direction == "upstream":
-        pattern = "(start)<-[:%s*1..%d]-(affected:Entity)"
     else:
-        pattern = "(start)-[:%s*1..%d]->(affected:Entity)"
-    pattern = pattern % ("|".join(rel_types), max_depth)
-
-    query = f"""
-    MATCH (start:Entity)
-    WHERE {selector_predicate}
-      AND ($repo_name IS NULL OR start.repo_name = $repo_name)
-    MATCH path = {pattern}
-    WHERE $repo_name IS NULL OR affected.repo_name = $repo_name
-    WITH affected, affected.identity_key AS affected_identity, length(path) AS depth, [rel IN relationships(path) | type(rel)] AS chain
-    WITH affected, depth, chain, reduce(acc = '', rel IN chain | acc + '|' + rel) AS chain_key
-    ORDER BY affected_identity ASC, depth ASC, chain_key ASC
-    WITH affected, affected_identity, collect({{depth: depth, chain: chain}})[0] AS best
-    WITH affected, affected_identity, best.depth AS depth, best.chain AS chain
-    WHERE $cursor_depth IS NULL
-      OR depth > $cursor_depth
-      OR (depth = $cursor_depth AND affected_identity > $cursor_uri)
-    RETURN
-        affected_identity AS identity_key,
-        affected.global_uri AS uri,
-        affected.scip_symbol AS scip_symbol,
-        affected.entity_type AS type,
-        affected.entity_name AS name,
-        affected.file_path AS file,
-        depth,
-        chain
-    ORDER BY depth ASC, identity_key ASC
-    """
-    if max_results is not None:
-        query += "\nLIMIT $limit"
-
-    run_params = {
-        "repo_name": repo_name,
-        "cursor_depth": cursor_depth,
-        "cursor_uri": cursor_uri,
-    }
-    run_params.update(selector_params)
-    if max_results is not None:
-        run_params["limit"] = max_results + 1
-
-    with driver.session() as session:
-        records = list(
-            session.run(
-                Query(query, timeout=query_timeout_s),
-                **run_params,
-            )
+        expand_query = Query(
+            """
+            UNWIND $frontier AS frontier_node_id
+            MATCH (frontier:Entity)
+            WHERE elementId(frontier) = frontier_node_id
+            MATCH (frontier)-[r]->(affected:Entity)
+            WHERE type(r) IN $rel_types
+            RETURN DISTINCT
+                elementId(affected) AS node_id,
+                affected.identity_key AS identity_key,
+                affected.global_uri AS uri,
+                affected.scip_symbol AS scip_symbol,
+                affected.entity_type AS type,
+                affected.entity_name AS name,
+                affected.file_path AS file,
+                affected.repo_name AS repo_name
+            """,
+            timeout=query_timeout_s,
         )
 
+    frontier_node_ids = [root_node["node_id"]]
+    visited_node_ids = {root_node["node_id"]}
+    discovered: dict[str, dict[str, object]] = {}
+
+    with driver.session() as session:
+        for depth in range(1, max_depth + 1):
+            if not frontier_node_ids:
+                break
+            records = list(
+                session.run(
+                    expand_query,
+                    frontier=frontier_node_ids,
+                    rel_types=rel_types,
+                )
+            )
+            next_frontier: list[str] = []
+            for record in records:
+                node_id = record["node_id"]
+                if node_id in visited_node_ids:
+                    continue
+                visited_node_ids.add(node_id)
+                next_frontier.append(node_id)
+                identity = record.get("identity_key") or record["uri"]
+                discovered[identity] = {
+                    "identity_key": identity,
+                    "uri": record["uri"],
+                    "scip_symbol": record.get("scip_symbol") or "",
+                    "type": record["type"],
+                    "name": record["name"],
+                    "file": record["file"],
+                    "repo_name": record.get("repo_name"),
+                    "depth": depth,
+                    "node_id": node_id,
+                }
+            frontier_node_ids = next_frontier
+
+        filtered_records = [
+            rec
+            for rec in discovered.values()
+            if repo_name is None or rec.get("repo_name") == repo_name
+        ]
+        filtered_records.sort(
+            key=lambda rec: (int(rec["depth"]), str(rec["identity_key"]))
+        )
+        if cursor_depth is not None and cursor_uri is not None:
+            filtered_records = [
+                rec
+                for rec in filtered_records
+                if int(rec["depth"]) > cursor_depth
+                or (
+                    int(rec["depth"]) == cursor_depth
+                    and str(rec["identity_key"]) > cursor_uri
+                )
+            ]
+
         next_cursor = None
-        visible_records = records
-        if max_results is not None and len(records) > max_results:
-            visible_records = records[:max_results]
+        visible_records = filtered_records
+        if max_results is not None and len(filtered_records) > max_results:
+            visible_records = filtered_records[:max_results]
             last_visible = visible_records[-1]
-            cursor_identity = last_visible.get("identity_key") or last_visible["uri"]
-            next_cursor = _encode_cursor(last_visible["depth"], cursor_identity)
+            next_cursor = _encode_cursor(
+                int(last_visible["depth"]),
+                str(last_visible["identity_key"]),
+            )
+
+        chain_by_node_id: dict[str, list[str]] = {}
+        if visible_records:
+            shortest_path_pattern = _build_shortest_path_pattern(
+                direction=direction,
+                rel_types=rel_types,
+                max_depth=max_depth,
+            )
+            chain_query = Query(
+                f"""
+                MATCH (start:Entity)
+                WHERE elementId(start) = $start_node_id
+                UNWIND $target_node_ids AS target_node_id
+                MATCH (target:Entity)
+                WHERE elementId(target) = target_node_id
+                MATCH path = shortestPath({shortest_path_pattern})
+                RETURN elementId(target) AS node_id, [rel IN relationships(path) | type(rel)] AS chain
+                """,
+                timeout=query_timeout_s,
+            )
+            chain_records = session.run(
+                chain_query,
+                start_node_id=root_node["node_id"],
+                target_node_ids=[str(rec["node_id"]) for rec in visible_records],
+            )
+            for rec in chain_records:
+                chain_by_node_id[rec["node_id"]] = rec.get("chain") or []
 
         for record in visible_records:
             result.affected_entities.append(
                 AffectedEntity(
-                    identity_key=record.get("identity_key") or record["uri"],
-                    global_uri=record["uri"],
-                    scip_symbol=record.get("scip_symbol") or "",
-                    entity_type=record["type"],
-                    entity_name=record["name"],
-                    file_path=record["file"],
-                    depth=record["depth"],
-                    relationship_chain=record["chain"],
+                    identity_key=str(record["identity_key"]),
+                    global_uri=str(record["uri"]),
+                    scip_symbol=str(record.get("scip_symbol") or ""),
+                    entity_type=str(record["type"]),
+                    entity_name=str(record["name"]),
+                    file_path=str(record["file"]),
+                    depth=int(record["depth"]),
+                    relationship_chain=chain_by_node_id.get(str(record["node_id"]), []),
                 )
             )
-        
+
         result.total_count = len(result.affected_entities)
         result.max_depth_reached = (
             max(e.depth for e in result.affected_entities)
@@ -389,7 +529,7 @@ def get_entity_neighbors(
     if driver is None:
         raise ValueError("driver is required")
     rel_types = _sanitize_relationship_types(relationship_types)
-    selector_predicate, selector_params, _ = _resolve_entity_selector(
+    selector_predicate, selector_params, _, selector_type = _resolve_entity_selector(
         identity_key=identity_key,
         scip_symbol=scip_symbol,
         owner_repo=owner_repo,
@@ -397,39 +537,32 @@ def get_entity_neighbors(
     )
 
     metadata = QueryMetadata(query_timeout_s=query_timeout_s)
-    with driver.session() as session:
-        root_record = session.run(
-            Query(
-                f"""
-                MATCH (start:Entity)
-                WHERE {selector_predicate}
-                  AND ($repo_name IS NULL OR start.repo_name = $repo_name)
-                RETURN count(start) AS root_count
-                """,
-                timeout=query_timeout_s,
-            ),
-            **selector_params,
-            repo_name=repo_name,
-        ).single()
-        if root_record is None or root_record["root_count"] == 0:
-            metadata.status = "missing_root"
-            metadata.reason = "origin_not_found"
-            return {"inbound": [], "outbound": [], "metadata": metadata}
+    root_node = _resolve_root_node(
+        driver=driver,
+        selector_predicate=selector_predicate,
+        selector_params=selector_params,
+        selector_type=selector_type,
+        repo_name=repo_name,
+        metadata=metadata,
+        query_timeout_s=query_timeout_s,
+    )
+    if root_node is None:
+        return {"inbound": [], "outbound": [], "metadata": metadata}
 
+    with driver.session() as session:
         src_label = "" if include_non_entity else ":Entity"
         tgt_label = "" if include_non_entity else ":Entity"
 
-        inbound_query = f"""
+        inbound_query = """
         MATCH (start:Entity)
-        WHERE {selector_predicate}
-          AND ($repo_name IS NULL OR start.repo_name = $repo_name)
+        WHERE elementId(start) = $start_node_id
         MATCH (src{src_label})-[r]->(start)
         WHERE type(r) IN $rel_types
           AND ($repo_name IS NULL OR src.repo_name = $repo_name)
         RETURN DISTINCT src.identity_key AS identity_key, src.global_uri AS uri, src.entity_type AS type, type(r) AS relationship
         ORDER BY relationship ASC, identity_key ASC
         LIMIT $limit
-        """
+        """.format(src_label=src_label)
         inbound = [
             {
                 "identity_key": rec.get("identity_key") or rec["uri"],
@@ -439,24 +572,23 @@ def get_entity_neighbors(
             }
             for rec in session.run(
                 Query(inbound_query, timeout=query_timeout_s),
-                **selector_params,
+                start_node_id=root_node["node_id"],
                 rel_types=rel_types,
                 repo_name=repo_name,
                 limit=max_results,
             )
         ]
 
-        outbound_query = f"""
+        outbound_query = """
         MATCH (start:Entity)
-        WHERE {selector_predicate}
-          AND ($repo_name IS NULL OR start.repo_name = $repo_name)
+        WHERE elementId(start) = $start_node_id
         MATCH (start)-[r]->(tgt{tgt_label})
         WHERE type(r) IN $rel_types
           AND ($repo_name IS NULL OR tgt.repo_name = $repo_name)
         RETURN DISTINCT tgt.identity_key AS identity_key, tgt.global_uri AS uri, tgt.entity_type AS type, type(r) AS relationship
         ORDER BY relationship ASC, identity_key ASC
         LIMIT $limit
-        """
+        """.format(tgt_label=tgt_label)
         outbound = [
             {
                 "identity_key": rec.get("identity_key") or rec["uri"],
@@ -466,7 +598,7 @@ def get_entity_neighbors(
             }
             for rec in session.run(
                 Query(outbound_query, timeout=query_timeout_s),
-                **selector_params,
+                start_node_id=root_node["node_id"],
                 rel_types=rel_types,
                 repo_name=repo_name,
                 limit=max_results,
@@ -510,7 +642,7 @@ def get_inheritance_tree(
         raise ValueError("max_results must be >= 1")
     if driver is None:
         raise ValueError("driver is required")
-    selector_predicate, selector_params, _ = _resolve_entity_selector(
+    selector_predicate, selector_params, _, selector_type = _resolve_entity_selector(
         identity_key=identity_key,
         scip_symbol=scip_symbol,
         owner_repo=owner_repo,
@@ -518,29 +650,22 @@ def get_inheritance_tree(
     )
 
     metadata = QueryMetadata(query_timeout_s=query_timeout_s)
-    with driver.session() as session:
-        root_record = session.run(
-            Query(
-                f"""
-                MATCH (root:Entity)
-                WHERE {selector_predicate}
-                  AND ($repo_name IS NULL OR root.repo_name = $repo_name)
-                RETURN count(root) AS root_count
-                """,
-                timeout=query_timeout_s,
-            ),
-            **selector_params,
-            repo_name=repo_name,
-        ).single()
-        if root_record is None or root_record["root_count"] == 0:
-            metadata.status = "missing_root"
-            metadata.reason = "origin_not_found"
-            return {"ancestors": [], "descendants": [], "metadata": metadata}
+    root_node = _resolve_root_node(
+        driver=driver,
+        selector_predicate=selector_predicate,
+        selector_params=selector_params,
+        selector_type=selector_type,
+        repo_name=repo_name,
+        metadata=metadata,
+        query_timeout_s=query_timeout_s,
+    )
+    if root_node is None:
+        return {"ancestors": [], "descendants": [], "metadata": metadata}
 
+    with driver.session() as session:
         ancestors_query = f"""
         MATCH (root:Entity)
-        WHERE {selector_predicate}
-          AND ($repo_name IS NULL OR root.repo_name = $repo_name)
+        WHERE elementId(root) = $root_node_id
         MATCH path = (root)-[:INHERITS*1..]->(ancestor:Entity)
         WHERE $repo_name IS NULL OR ancestor.repo_name = $repo_name
         WITH ancestor.identity_key AS identity_key, ancestor.global_uri AS uri, min(length(path)) AS depth
@@ -552,7 +677,7 @@ def get_inheritance_tree(
             rec["uri"]
             for rec in session.run(
                 Query(ancestors_query, timeout=query_timeout_s),
-                **selector_params,
+                root_node_id=root_node["node_id"],
                 repo_name=repo_name,
                 limit=max_results,
             )
@@ -560,8 +685,7 @@ def get_inheritance_tree(
 
         descendants_query = f"""
         MATCH (root:Entity)
-        WHERE {selector_predicate}
-          AND ($repo_name IS NULL OR root.repo_name = $repo_name)
+        WHERE elementId(root) = $root_node_id
         MATCH path = (descendant:Entity)-[:INHERITS*1..]->(root)
         WHERE $repo_name IS NULL OR descendant.repo_name = $repo_name
         WITH descendant.identity_key AS identity_key, descendant.global_uri AS uri, min(length(path)) AS depth
@@ -573,7 +697,7 @@ def get_inheritance_tree(
             rec["uri"]
             for rec in session.run(
                 Query(descendants_query, timeout=query_timeout_s),
-                **selector_params,
+                root_node_id=root_node["node_id"],
                 repo_name=repo_name,
                 limit=max_results,
             )

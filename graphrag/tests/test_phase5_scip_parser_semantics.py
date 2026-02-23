@@ -9,6 +9,7 @@ from graphrag.scip_parser import (
     _build_enclosing_scope_map,
     _collect_index_definition_symbols,
     parse_scip_index,
+    parse_scip_index_stream,
 )
 from graphrag.symbol_mapper import classify_symbol
 
@@ -127,6 +128,67 @@ class TestEnclosingScopeSweepLine(unittest.TestCase):
         self.assertEqual(scope_map[55], "cxx . . $ YAML/inner(bbbb).")
         self.assertEqual(scope_map[70], "cxx . . $ YAML/outer(aaaa).")
         self.assertEqual(scope_map[999_999], "cxx . . $ YAML/outer(aaaa).")
+
+
+class TestStreamingParser(unittest.TestCase):
+    def _build_multi_doc_index(self, doc_count: int = 3) -> str:
+        index = scip_pb2.Index()
+        index.metadata.version = scip_pb2.UnspecifiedProtocolVersion
+        index.metadata.tool_info.name = "phase5-stream-test"
+        index.metadata.tool_info.version = "1.0.0"
+        index.metadata.project_root = "file:///phase5"
+        index.metadata.text_document_encoding = scip_pb2.UTF8
+
+        for i in range(doc_count):
+            doc = index.documents.add()
+            doc.language = "cpp"
+            doc.relative_path = f"src/file_{i}.cpp"
+            doc.position_encoding = scip_pb2.UTF8CodeUnitOffsetFromLineStart
+
+            symbol = f"cxx . . $ YAML/Thing{i}#"
+            sym_info = doc.symbols.add()
+            sym_info.symbol = symbol
+            sym_info.kind = scip_pb2.SymbolInformation.Kind.Class
+            sym_info.display_name = f"Thing{i}"
+
+            occ_def = doc.occurrences.add()
+            occ_def.symbol = symbol
+            occ_def.range.extend([0, 0, 0, 4])
+            occ_def.enclosing_range.extend([0, 0, 0, 4])
+            occ_def.symbol_roles = 0x1
+
+            occ_ref = doc.occurrences.add()
+            occ_ref.symbol = symbol
+            occ_ref.range.extend([1, 0, 1, 4])
+            occ_ref.symbol_roles = 0x8
+
+        handle = tempfile.NamedTemporaryFile(suffix=".scip", delete=False)
+        handle.write(index.SerializeToString())
+        handle.flush()
+        handle.close()
+        return handle.name
+
+    def test_streaming_batches_and_compat_result(self) -> None:
+        index_path = self._build_multi_doc_index(doc_count=3)
+        try:
+            batches = list(
+                parse_scip_index_stream(
+                    index_path,
+                    repo_name="phase5",
+                    batch_documents=2,
+                )
+            )
+            self.assertEqual(len(batches), 2)
+            self.assertEqual([b.document_count for b in batches], [2, 1])
+            self.assertEqual(sum(len(b.symbols) for b in batches), 3)
+            self.assertEqual(sum(len(b.references) for b in batches), 3)
+
+            compat = parse_scip_index(index_path, repo_name="phase5")
+            self.assertEqual(compat.document_count, 3)
+            self.assertEqual(len(compat.symbols), 3)
+            self.assertEqual(len(compat.references), 3)
+        finally:
+            Path(index_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

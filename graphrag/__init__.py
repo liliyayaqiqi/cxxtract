@@ -4,6 +4,7 @@ GraphRAG module — Semantic dependency graph pipeline for C++ codebases.
 Public API:
     - run_scip_clang: Generate SCIP index from compile_commands.json
     - parse_scip_index: Parse .scip protobuf into Python objects
+    - parse_scip_index_stream: Stream parse .scip protobuf in batches
     - scip_symbol_to_global_uri: Map SCIP symbols to Global URIs
     - get_neo4j_driver: Connect to Neo4j
     - init_graph_schema: Initialize Neo4j constraints/indexes
@@ -14,7 +15,12 @@ Public API:
 """
 
 from graphrag.scip_index import run_scip_clang
-from graphrag.scip_parser import parse_scip_index, ScipParseResult
+from graphrag.scip_parser import (
+    parse_scip_index,
+    parse_scip_index_stream,
+    ScipParseBatch,
+    ScipParseResult,
+)
 from graphrag.symbol_mapper import scip_symbol_to_global_uri, is_external_symbol
 from graphrag.neo4j_loader import (
     get_neo4j_driver,
@@ -39,6 +45,8 @@ __all__ = [
     "run_scip_clang",
     # SCIP Parsing
     "parse_scip_index",
+    "parse_scip_index_stream",
+    "ScipParseBatch",
     "ScipParseResult",
     # Symbol Mapping
     "scip_symbol_to_global_uri",

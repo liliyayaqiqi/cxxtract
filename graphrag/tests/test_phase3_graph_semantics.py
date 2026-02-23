@@ -13,6 +13,7 @@ from graphrag.neo4j_loader import (
     _dedupe_nodes,
     _infer_implementation_edge_type,
     _validate_edges,
+    init_graph_schema,
 )
 from graphrag.proto import scip_pb2
 from graphrag.scip_parser import ScipRelationship, ScipSymbolDef
@@ -260,6 +261,38 @@ class TestPhase3Invariants(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0].src_uri, valid_src)
         self.assertEqual(filtered[0].tgt_uri, valid_tgt)
+
+
+class _SchemaSession:
+    def __init__(self, calls: list[str]):
+        self._calls = calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+    def run(self, query, **params):  # noqa: ARG002
+        self._calls.append(str(query))
+        return None
+
+
+class _SchemaDriver:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def session(self):
+        return _SchemaSession(self.calls)
+
+
+class TestPhase3Schema(unittest.TestCase):
+    def test_init_schema_creates_identity_key_index(self) -> None:
+        driver = _SchemaDriver()
+        init_graph_schema(driver)
+        joined = "\n".join(driver.calls)
+        self.assertIn("entity_identity_key_idx", joined)
+        self.assertIn("ON (e.identity_key)", joined)
 
 
 if __name__ == "__main__":

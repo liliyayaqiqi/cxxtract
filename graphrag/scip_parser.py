@@ -12,7 +12,7 @@ ignored namespaces (std::, boost::, etc.) never enter the pipeline.
 import logging
 import heapq
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
 
 from graphrag.proto import scip_pb2
 from graphrag.symbol_mapper import classify_symbol, should_drop_symbol
@@ -59,6 +59,18 @@ class ScipReference:
 class ScipParseResult:
     """Result of parsing a SCIP index."""
     
+    symbols: list[ScipSymbolDef]
+    references: list[ScipReference]
+    document_count: int
+    external_symbol_count: int
+    dropped_symbol_count: int = 0
+    dropped_reference_count: int = 0
+
+
+@dataclass
+class ScipParseBatch:
+    """Streaming parse batch emitted by ``parse_scip_index_stream``."""
+
     symbols: list[ScipSymbolDef]
     references: list[ScipReference]
     document_count: int
@@ -201,168 +213,237 @@ def _build_enclosing_scope_map(
     return scope_map
 
 
-def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
-    """Parse a SCIP index file into structured Python objects.
-    
-    Args:
-        index_path: Path to the .scip index file.
-        repo_name: Repository name (not stored in SCIP, needed for URI generation).
-        
-    Returns:
-        ScipParseResult containing all symbols and references.
-        
-    Raises:
-        FileNotFoundError: If index file doesn't exist.
-        
-    Example:
-        >>> result = parse_scip_index("output/index.scip", "yaml-cpp")
-        >>> print(f"Parsed {result.document_count} documents")
-    """
+def _load_scip_index(index_path: str) -> scip_pb2.Index:
+    """Load a SCIP index protobuf from disk."""
     logger.info(f"Parsing SCIP index: {index_path}")
-    
     with open(index_path, "rb") as f:
         index = scip_pb2.Index()
         index.ParseFromString(f.read())
-    
+
     logger.info(
         f"SCIP index loaded: tool={index.metadata.tool_info.name} "
         f"v{index.metadata.tool_info.version}, "
         f"project_root={index.metadata.project_root}"
     )
-    
+    return index
+
+
+def _parse_document(
+    doc: scip_pb2.Document,
+    local_definition_symbols: set[str],
+) -> tuple[list[ScipSymbolDef], list[ScipReference], int, int]:
+    """Parse one SCIP document into symbols/references."""
     symbols: list[ScipSymbolDef] = []
     references: list[ScipReference] = []
     dropped_syms = 0
     dropped_refs = 0
 
-    local_definition_symbols = _collect_index_definition_symbols(index)
-    
-    # Process each document
-    for doc in index.documents:
-        file_path = doc.relative_path
-        
-        reference_lines = {
-            occ.range[0]
-            for occ in doc.occurrences
-            if len(occ.range) >= 3 and not (occ.symbol_roles & 0x1)
-        }
-        # Build enclosing scope map for this document.
-        scope_map = _build_enclosing_scope_map(doc, reference_lines=reference_lines)
-        definition_ranges = _collect_definition_ranges(doc)
-        
-        # Extract symbol definitions
-        for sym_info in doc.symbols:
-            # Skip local symbols (not globally addressable)
-            if sym_info.symbol.startswith("local "):
-                continue
-            
-            # Smart filtering: classify before spending effort on extraction
-            disposition = classify_symbol(
+    file_path = doc.relative_path
+
+    reference_lines = {
+        occ.range[0]
+        for occ in doc.occurrences
+        if len(occ.range) >= 3 and not (occ.symbol_roles & 0x1)
+    }
+    scope_map = _build_enclosing_scope_map(doc, reference_lines=reference_lines)
+    definition_ranges = _collect_definition_ranges(doc)
+
+    for sym_info in doc.symbols:
+        if sym_info.symbol.startswith("local "):
+            continue
+
+        disposition = classify_symbol(
+            sym_info.symbol,
+            sym_info.kind,
+            is_local_definition=(sym_info.symbol in local_definition_symbols),
+        )
+        if disposition == "drop":
+            dropped_syms += 1
+            continue
+        if disposition == "stub":
+            logger.debug(
+                "Treating symbol as stub (non-local definition): %s",
                 sym_info.symbol,
-                sym_info.kind,
-                is_local_definition=(sym_info.symbol in local_definition_symbols),
             )
-            if disposition == "drop":
-                dropped_syms += 1
+
+        rels: list[ScipRelationship] = []
+        for rel in sym_info.relationships:
+            tgt_disp = classify_symbol(
+                rel.symbol,
+                is_local_definition=(rel.symbol in local_definition_symbols),
+            )
+            if tgt_disp == "drop":
                 continue
-            if disposition == "stub":
-                logger.debug("Treating symbol as stub (non-local definition): %s", sym_info.symbol)
-            
-            # Extract relationships, filtering targets too
-            rels: list[ScipRelationship] = []
-            for rel in sym_info.relationships:
-                tgt_disp = classify_symbol(
+            if tgt_disp == "stub":
+                logger.debug(
+                    "Treating relationship target as stub: src=%s target=%s",
+                    sym_info.symbol,
                     rel.symbol,
-                    is_local_definition=(rel.symbol in local_definition_symbols),
                 )
-                if tgt_disp == "drop":
-                    continue
-                if tgt_disp == "stub":
-                    logger.debug(
-                        "Treating relationship target as stub: src=%s target=%s",
-                        sym_info.symbol,
-                        rel.symbol,
-                    )
-                rels.append(
-                    ScipRelationship(
-                        target_symbol=rel.symbol,
-                        is_reference=rel.is_reference,
-                        is_implementation=rel.is_implementation,
-                        is_type_definition=rel.is_type_definition,
-                        is_definition=rel.is_definition,
-                    )
-                )
-            
-            def_range = definition_ranges.get(sym_info.symbol)
-            
-            symbols.append(
-                ScipSymbolDef(
-                    scip_symbol=sym_info.symbol,
-                    file_path=file_path,
-                    kind=sym_info.kind,
-                    display_name=sym_info.display_name,
-                    disposition=disposition,
-                    definition_range=def_range,
-                    relationships=rels,
+            rels.append(
+                ScipRelationship(
+                    target_symbol=rel.symbol,
+                    is_reference=rel.is_reference,
+                    is_implementation=rel.is_implementation,
+                    is_type_definition=rel.is_type_definition,
+                    is_definition=rel.is_definition,
                 )
             )
-        
-        # Extract reference occurrences (for CALLS edges)
-        for occ in doc.occurrences:
-            is_def = (occ.symbol_roles & 0x1) > 0
-            
-            if is_def or not occ.symbol or occ.symbol.startswith("local "):
-                continue
-            
-            # Smart filtering: drop references TO ignored namespaces
-            occ_local = occ.symbol in local_definition_symbols
-            occ_disp = classify_symbol(
-                occ.symbol,
-                is_local_definition=occ_local,
+
+        symbols.append(
+            ScipSymbolDef(
+                scip_symbol=sym_info.symbol,
+                file_path=file_path,
+                kind=sym_info.kind,
+                display_name=sym_info.display_name,
+                disposition=disposition,
+                definition_range=definition_ranges.get(sym_info.symbol),
+                relationships=rels,
             )
-            if occ_disp == "drop":
-                dropped_refs += 1
-                continue
-            if occ_disp == "stub":
-                logger.debug("Reference target resolved as stub: %s", occ.symbol)
-            
-            # Also drop references FROM ignored enclosing symbols
-            line = occ.range[0] if len(occ.range) >= 3 else -1
-            enclosing_sym = scope_map.get(line)
-            if enclosing_sym and should_drop_symbol(
-                enclosing_sym,
-                is_local_definition=(enclosing_sym in local_definition_symbols),
-            ):
-                dropped_refs += 1
-                continue
-            
-            # Determine which definition this reference falls within
-            if len(occ.range) < 3:
-                continue
-            
-            enclosing = scope_map.get(line)
-            role = _infer_role_from_symbol_roles(occ.symbol_roles)
-            
-            references.append(
-                ScipReference(
-                    scip_symbol=occ.symbol,
-                    file_path=file_path,
-                    enclosing_symbol=enclosing,
-                    role=role,
-                    line=line,
-                )
+        )
+
+    for occ in doc.occurrences:
+        is_def = (occ.symbol_roles & 0x1) > 0
+
+        if is_def or not occ.symbol or occ.symbol.startswith("local "):
+            continue
+
+        occ_local = occ.symbol in local_definition_symbols
+        occ_disp = classify_symbol(
+            occ.symbol,
+            is_local_definition=occ_local,
+        )
+        if occ_disp == "drop":
+            dropped_refs += 1
+            continue
+        if occ_disp == "stub":
+            logger.debug("Reference target resolved as stub: %s", occ.symbol)
+
+        line = occ.range[0] if len(occ.range) >= 3 else -1
+        enclosing_sym = scope_map.get(line)
+        if enclosing_sym and should_drop_symbol(
+            enclosing_sym,
+            is_local_definition=(enclosing_sym in local_definition_symbols),
+        ):
+            dropped_refs += 1
+            continue
+        if len(occ.range) < 3:
+            continue
+
+        references.append(
+            ScipReference(
+                scip_symbol=occ.symbol,
+                file_path=file_path,
+                enclosing_symbol=scope_map.get(line),
+                role=_infer_role_from_symbol_roles(occ.symbol_roles),
+                line=line,
             )
-    
+        )
+
+    return symbols, references, dropped_syms, dropped_refs
+
+
+def _iter_scip_parse_batches(
+    *,
+    index: scip_pb2.Index,
+    batch_documents: int,
+) -> Iterator[ScipParseBatch]:
+    """Yield parsed document batches to bound peak memory during ingestion."""
+    if batch_documents < 1:
+        raise ValueError("batch_documents must be >= 1")
+
+    local_definition_symbols = _collect_index_definition_symbols(index)
+
+    batch_symbols: list[ScipSymbolDef] = []
+    batch_references: list[ScipReference] = []
+    batch_docs = 0
+    batch_dropped_syms = 0
+    batch_dropped_refs = 0
+
+    for doc in index.documents:
+        symbols, references, dropped_syms, dropped_refs = _parse_document(
+            doc,
+            local_definition_symbols,
+        )
+        batch_symbols.extend(symbols)
+        batch_references.extend(references)
+        batch_dropped_syms += dropped_syms
+        batch_dropped_refs += dropped_refs
+        batch_docs += 1
+
+        if batch_docs >= batch_documents:
+            yield ScipParseBatch(
+                symbols=batch_symbols,
+                references=batch_references,
+                document_count=batch_docs,
+                external_symbol_count=len(index.external_symbols),
+                dropped_symbol_count=batch_dropped_syms,
+                dropped_reference_count=batch_dropped_refs,
+            )
+            batch_symbols = []
+            batch_references = []
+            batch_docs = 0
+            batch_dropped_syms = 0
+            batch_dropped_refs = 0
+
+    if batch_docs > 0:
+        yield ScipParseBatch(
+            symbols=batch_symbols,
+            references=batch_references,
+            document_count=batch_docs,
+            external_symbol_count=len(index.external_symbols),
+            dropped_symbol_count=batch_dropped_syms,
+            dropped_reference_count=batch_dropped_refs,
+        )
+
+
+def parse_scip_index_stream(
+    index_path: str,
+    repo_name: str,
+    batch_documents: int = 32,
+) -> Iterator[ScipParseBatch]:
+    """Stream-parse a SCIP index and yield batches of parsed entities.
+
+    This API is intended for memory-bounded ingestion pipelines.  For
+    compatibility, ``parse_scip_index()`` still returns a fully materialized
+    ``ScipParseResult`` by consuming this generator.
+    """
+    del repo_name  # Repo identifier is consumed downstream during URI mapping.
+    index = _load_scip_index(index_path)
+    yield from _iter_scip_parse_batches(index=index, batch_documents=batch_documents)
+
+
+def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
+    """Parse a SCIP index file into structured Python objects.
+
+    For large indexes, prefer ``parse_scip_index_stream()`` to avoid retaining
+    all parsed symbols/references in memory at once.
+    """
+    del repo_name  # Repo identifier is consumed downstream during URI mapping.
+    index = _load_scip_index(index_path)
+    symbols: list[ScipSymbolDef] = []
+    references: list[ScipReference] = []
+    document_count = 0
+    dropped_syms = 0
+    dropped_refs = 0
+
+    for batch in _iter_scip_parse_batches(index=index, batch_documents=32):
+        symbols.extend(batch.symbols)
+        references.extend(batch.references)
+        document_count += batch.document_count
+        dropped_syms += batch.dropped_symbol_count
+        dropped_refs += batch.dropped_reference_count
+
     logger.info(
         f"Parsed {len(symbols)} symbol definitions, "
-        f"{len(references)} references from {len(index.documents)} documents "
+        f"{len(references)} references from {document_count} documents "
         f"(dropped {dropped_syms} symbols, {dropped_refs} references)"
     )
-    
+
     return ScipParseResult(
         symbols=symbols,
         references=references,
-        document_count=len(index.documents),
+        document_count=document_count,
         external_symbol_count=len(index.external_symbols),
         dropped_symbol_count=dropped_syms,
         dropped_reference_count=dropped_refs,

@@ -291,7 +291,7 @@ def init_graph_schema(driver: Driver) -> None:
     
     Creates:
     - Unique constraint on (Entity.owner_repo, Entity.scip_symbol)
-    - Indexes on global_uri, entity_type, repo_name, file_path for filtering
+    - Indexes on identity_key, global_uri, entity_type, repo_name, file_path for filtering
     
     Args:
         driver: Connected Neo4j driver.
@@ -317,6 +317,7 @@ def init_graph_schema(driver: Driver) -> None:
         
         # Indexes for filtering
         indexes = [
+            ("entity_identity_key_idx", "identity_key"),
             ("entity_uri_idx", "global_uri"),
             ("entity_type_idx", "entity_type"),
             ("entity_repo_idx", "repo_name"),
