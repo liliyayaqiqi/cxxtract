@@ -113,7 +113,7 @@ class TestPhase3StubAndDedup(unittest.TestCase):
         self.assertEqual(len({n.function_sig_hash for n in nodes}), 2)
         self.assertEqual(len(_dedupe_nodes(nodes)), 2)
 
-    def test_cross_repo_stub_completes_with_owner_repo_uri(self) -> None:
+    def test_cross_repo_stub_completes_with_owner_symbol_key(self) -> None:
         src_symbol = "cxx . . $ YAML/Widget#"
         target_symbol = "cxx . . $ webrtc/RtpSender#"
 
@@ -160,7 +160,7 @@ class TestPhase3StubAndDedup(unittest.TestCase):
                 symbols=[
                     ScipSymbolDef(
                         scip_symbol=target_symbol,
-                        file_path="<external>",
+                        file_path="api/rtp_sender.h",
                         kind=scip_pb2.SymbolInformation.Kind.Class,
                         display_name="RtpSender",
                     )
@@ -168,12 +168,15 @@ class TestPhase3StubAndDedup(unittest.TestCase):
                 repo_name="repo-b",
             )
             self.assertEqual(len(owner_nodes), 1)
-            self.assertEqual(stub.global_uri, owner_nodes[0].global_uri)
+            self.assertNotEqual(stub.global_uri, owner_nodes[0].global_uri)
+            self.assertEqual(stub.owner_repo, owner_nodes[0].owner_repo)
+            self.assertEqual(stub.scip_symbol, owner_nodes[0].scip_symbol)
 
             deduped = _dedupe_nodes(stub_nodes + owner_nodes)
             self.assertEqual(len(deduped), 1)
             self.assertFalse(deduped[0].is_external)
             self.assertEqual(deduped[0].repo_name, "repo-b")
+            self.assertEqual(deduped[0].file_path, "api/rtp_sender.h")
 
     def test_stub_symbol_definition_uses_owner_repo_uri(self) -> None:
         with patch.dict(
