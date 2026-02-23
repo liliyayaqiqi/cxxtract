@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from core.uri_contract import parse_global_uri
+from core.uri_contract import build_identity_key, parse_global_uri
 from neo4j import GraphDatabase, Driver, Session
 
 from graphrag.config import (
@@ -45,6 +45,8 @@ class GraphNode:
     is_external: bool
     ingestion_repo: Optional[str] = None
     owner_repo: Optional[str] = None
+    function_sig_hash: Optional[str] = None
+    identity_key: Optional[str] = None
 
 
 @dataclass
@@ -54,6 +56,8 @@ class GraphEdge:
     src_uri: str
     tgt_uri: str
     relationship_type: str  # INHERITS, CALLS, etc.
+    src_identity_key: Optional[str] = None
+    tgt_identity_key: Optional[str] = None
 
 
 @dataclass
@@ -170,22 +174,27 @@ def _infer_reference_edge_type(
 
 def _dedupe_nodes(nodes: list[GraphNode]) -> list[GraphNode]:
     """Deduplicate nodes by URI, preferring local definition over stub."""
-    by_uri: dict[str, GraphNode] = {}
+    by_identity: dict[str, GraphNode] = {}
     for node in nodes:
-        existing = by_uri.get(node.global_uri)
+        identity = node.identity_key or node.global_uri
+        existing = by_identity.get(identity)
         if existing is None:
-            by_uri[node.global_uri] = node
+            by_identity[identity] = node
             continue
         if existing.is_external and not node.is_external:
-            by_uri[node.global_uri] = node
-    return list(by_uri.values())
+            by_identity[identity] = node
+    return list(by_identity.values())
 
 
 def _dedupe_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
     """Deduplicate edges by (src, target, relationship type)."""
     by_key: dict[tuple[str, str, str], GraphEdge] = {}
     for edge in edges:
-        key = (edge.src_uri, edge.tgt_uri, edge.relationship_type)
+        key = (
+            edge.src_identity_key or edge.src_uri,
+            edge.tgt_identity_key or edge.tgt_uri,
+            edge.relationship_type,
+        )
         if key not in by_key:
             by_key[key] = edge
     return list(by_key.values())
@@ -281,8 +290,8 @@ def init_graph_schema(driver: Driver) -> None:
     """Initialize Neo4j schema with constraints and indexes.
     
     Creates:
-    - Unique constraint on Entity.global_uri
-    - Indexes on entity_type, repo_name, file_path for filtering
+    - Unique constraint on Entity.identity_key
+    - Indexes on global_uri, entity_type, repo_name, file_path for filtering
     
     Args:
         driver: Connected Neo4j driver.
@@ -293,17 +302,22 @@ def init_graph_schema(driver: Driver) -> None:
     with driver.session() as session:
         logger.info("Initializing Neo4j schema...")
         
-        # Unique constraint on global_uri
+        # Migrate away from legacy uniqueness on join-key global_uri.
+        # Overloaded functions may share global_uri and differ by identity_key.
+        session.run("DROP CONSTRAINT entity_uri IF EXISTS")
+
+        # Unique constraint on internal identity_key
         session.run(
             """
-            CREATE CONSTRAINT entity_uri IF NOT EXISTS
-            FOR (e:Entity) REQUIRE e.global_uri IS UNIQUE
+            CREATE CONSTRAINT entity_identity IF NOT EXISTS
+            FOR (e:Entity) REQUIRE e.identity_key IS UNIQUE
             """
         )
-        logger.debug("Created constraint: entity_uri")
+        logger.debug("Created constraint: entity_identity")
         
         # Indexes for filtering
         indexes = [
+            ("entity_uri_idx", "global_uri"),
             ("entity_type_idx", "entity_type"),
             ("entity_repo_idx", "repo_name"),
             ("entity_file_idx", "file_path"),
@@ -382,7 +396,7 @@ def _build_nodes_from_symbols(
             uri_file_path,
             owner_repo,
             sym.kind,
-            include_function_sig=True,
+            include_function_sig=False,
         )
         
         if global_uri is None:
@@ -393,6 +407,12 @@ def _build_nodes_from_symbols(
         except ValueError:
             logger.warning(f"Malformed global_uri: {global_uri}")
             continue
+        parsed_sym = parse_scip_symbol(sym.scip_symbol, sym.kind)
+        function_sig_hash = (
+            parsed_sym.function_sig_hash
+            if parsed_sym and parsed_sym.entity_type == "Function"
+            else None
+        )
         
         nodes.append(
             GraphNode(
@@ -405,6 +425,11 @@ def _build_nodes_from_symbols(
                 is_external=is_stub_symbol,
                 ingestion_repo=repo_name,
                 owner_repo=owner_repo,
+                function_sig_hash=function_sig_hash,
+                identity_key=build_identity_key(
+                    global_uri,
+                    function_sig_hash=function_sig_hash,
+                ),
             )
         )
     
@@ -444,16 +469,34 @@ def _build_edges_from_relationships(
     seen_stubs: set[str] = set()  # Deduplicate stubs
     
     for sym in symbols:
+        parsed_src_symbol = parse_scip_symbol(sym.scip_symbol, sym.kind)
+        src_is_stub = sym.disposition == "stub"
+        src_repo_name = (
+            resolve_symbol_owner_repo(
+                sym.scip_symbol,
+                current_repo_name=repo_name,
+                kind=sym.kind,
+            )
+            if src_is_stub
+            else repo_name
+        )
+        src_file_path = "<external>" if src_is_stub else sym.file_path
         src_uri = scip_symbol_to_global_uri(
             sym.scip_symbol,
-            sym.file_path,
-            repo_name,
+            src_file_path,
+            src_repo_name,
             sym.kind,
-            include_function_sig=True,
+            include_function_sig=False,
         )
         
         if src_uri is None:
             continue
+        src_sig_hash = (
+            parsed_src_symbol.function_sig_hash
+            if parsed_src_symbol and parsed_src_symbol.entity_type == "Function"
+            else None
+        )
+        src_identity_key = build_identity_key(src_uri, function_sig_hash=src_sig_hash)
         
         for rel in sym.relationships:
             tgt_kind = symbol_kind_map.get(rel.target_symbol, 0)
@@ -495,17 +538,26 @@ def _build_edges_from_relationships(
                 tgt_file_path,
                 tgt_repo_name,
                 kind=tgt_kind,
-                include_function_sig=True,
+                include_function_sig=False,
             )
             
             if tgt_uri is None:
                 continue
+            parsed_tgt = parse_scip_symbol(rel.target_symbol, tgt_kind)
+            tgt_sig_hash = (
+                parsed_tgt.function_sig_hash
+                if parsed_tgt and parsed_tgt.entity_type == "Function"
+                else None
+            )
+            tgt_identity_key = build_identity_key(
+                tgt_uri,
+                function_sig_hash=tgt_sig_hash,
+            )
             
             # Create a stub node for cross-repo targets
-            if tgt_disposition == "stub" and tgt_uri not in seen_stubs:
-                seen_stubs.add(tgt_uri)
-                
-                parsed_tgt = parse_scip_symbol(rel.target_symbol, tgt_kind)
+            if tgt_disposition == "stub" and tgt_identity_key not in seen_stubs:
+                seen_stubs.add(tgt_identity_key)
+
                 if parsed_tgt:
                     stub_nodes.append(
                         GraphNode(
@@ -518,6 +570,8 @@ def _build_edges_from_relationships(
                             is_external=True,
                             ingestion_repo=repo_name,
                             owner_repo=tgt_repo_name,
+                            function_sig_hash=tgt_sig_hash,
+                            identity_key=tgt_identity_key,
                         )
                     )
             
@@ -534,6 +588,8 @@ def _build_edges_from_relationships(
                         GraphEdge(
                             src_uri=src_uri,
                             tgt_uri=tgt_uri,
+                            src_identity_key=src_identity_key,
+                            tgt_identity_key=tgt_identity_key,
                             relationship_type=rel_type,
                         )
                     )
@@ -551,6 +607,8 @@ def _build_edges_from_relationships(
                     GraphEdge(
                         src_uri=src_uri,
                         tgt_uri=tgt_uri,
+                        src_identity_key=src_identity_key,
+                        tgt_identity_key=tgt_identity_key,
                         relationship_type="USES_TYPE",
                     )
                 )
@@ -586,7 +644,9 @@ def _build_edges_from_references(
         List of GraphEdge objects for CALLS relationships.
     """
     edges: list[GraphEdge] = []
-    seen_stubs: set[str] = {n.global_uri for n in stub_nodes}
+    seen_stubs: set[str] = {
+        n.identity_key or n.global_uri for n in stub_nodes
+    }
     
     for ref in references:
         if ref.enclosing_symbol is None:
@@ -606,11 +666,21 @@ def _build_edges_from_references(
             enclosing_file,
             repo_name,
             kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
-            include_function_sig=True,
+            include_function_sig=False,
         )
         
         if src_uri is None:
             continue
+        parsed_src = parse_scip_symbol(
+            ref.enclosing_symbol,
+            kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
+        )
+        src_sig_hash = (
+            parsed_src.function_sig_hash
+            if parsed_src and parsed_src.entity_type == "Function"
+            else None
+        )
+        src_identity_key = build_identity_key(src_uri, function_sig_hash=src_sig_hash)
         
         # Classify the target
         tgt_kind = symbol_kind_map.get(ref.scip_symbol, 0)
@@ -648,17 +718,23 @@ def _build_edges_from_references(
             tgt_file,
             tgt_repo_name,
             kind=tgt_kind,
-            include_function_sig=True,
+            include_function_sig=False,
         )
         
         if tgt_uri is None:
             continue
+        parsed_tgt = parse_scip_symbol(ref.scip_symbol, kind=tgt_kind)
+        tgt_sig_hash = (
+            parsed_tgt.function_sig_hash
+            if parsed_tgt and parsed_tgt.entity_type == "Function"
+            else None
+        )
+        tgt_identity_key = build_identity_key(tgt_uri, function_sig_hash=tgt_sig_hash)
         
         # Create stub node for cross-repo targets
-        if tgt_disposition == "stub" and tgt_uri not in seen_stubs:
-            seen_stubs.add(tgt_uri)
-            
-            parsed_tgt = parse_scip_symbol(ref.scip_symbol, tgt_kind)
+        if tgt_disposition == "stub" and tgt_identity_key not in seen_stubs:
+            seen_stubs.add(tgt_identity_key)
+
             if parsed_tgt:
                 stub_nodes.append(
                     GraphNode(
@@ -671,14 +747,11 @@ def _build_edges_from_references(
                         is_external=True,
                         ingestion_repo=repo_name,
                         owner_repo=tgt_repo_name,
+                        function_sig_hash=tgt_sig_hash,
+                        identity_key=tgt_identity_key,
                     )
                 )
-        
-        parsed_src = parse_scip_symbol(
-            ref.enclosing_symbol,
-            kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
-        )
-        parsed_tgt = parse_scip_symbol(ref.scip_symbol, kind=tgt_kind)
+
         if parsed_src is None or parsed_tgt is None:
             continue
         rel_type = _infer_reference_edge_type(
@@ -693,6 +766,8 @@ def _build_edges_from_references(
             GraphEdge(
                 src_uri=src_uri,
                 tgt_uri=tgt_uri,
+                src_identity_key=src_identity_key,
+                tgt_identity_key=tgt_identity_key,
                 relationship_type=rel_type,
             )
         )
@@ -795,6 +870,8 @@ def ingest_graph(
                 node_dicts = [
                     {
                         "global_uri": n.global_uri,
+                        "identity_key": n.identity_key or n.global_uri,
+                        "function_sig_hash": n.function_sig_hash,
                         "repo_name": n.repo_name,
                         "ingestion_repo": n.ingestion_repo or repo_name,
                         "owner_repo": n.owner_repo or n.repo_name,
@@ -811,8 +888,11 @@ def ingest_graph(
                 result = session.run(
                     f"""
                     UNWIND $nodes AS n
-                    MERGE (e:Entity:{entity_type} {{global_uri: n.global_uri}})
+                    MERGE (e:Entity:{entity_type} {{identity_key: n.identity_key}})
                     SET e.repo_name = n.repo_name,
+                        e.global_uri = n.global_uri,
+                        e.identity_key = n.identity_key,
+                        e.function_sig_hash = n.function_sig_hash,
                         e.ingestion_repo = coalesce(e.ingestion_repo, n.ingestion_repo),
                         e.owner_repo = n.owner_repo,
                         e.file_path = n.file_path,
@@ -848,7 +928,10 @@ def ingest_graph(
                 batch = type_edges[i : i + batch_size]
                 
                 edge_dicts = [
-                    {"src_uri": e.src_uri, "tgt_uri": e.tgt_uri}
+                    {
+                        "src_identity_key": e.src_identity_key or e.src_uri,
+                        "tgt_identity_key": e.tgt_identity_key or e.tgt_uri,
+                    }
                     for e in batch
                 ]
                 
@@ -856,8 +939,8 @@ def ingest_graph(
                     result = session.run(
                         f"""
                         UNWIND $edges AS e
-                        MATCH (src:Entity {{global_uri: e.src_uri}})
-                        MATCH (tgt:Entity {{global_uri: e.tgt_uri}})
+                        MATCH (src:Entity {{identity_key: e.src_identity_key}})
+                        MATCH (tgt:Entity {{identity_key: e.tgt_identity_key}})
                         MERGE (src)-[r:{rel_type}]->(tgt)
                         RETURN count(r) AS count
                         """,
@@ -887,7 +970,9 @@ def ingest_graph(
             # Skip stubs from DEFINED_IN — they don't have a real file
             if node.file_path == "<external>":
                 continue
-            entities_by_file.setdefault(node.file_path, []).append(node.global_uri)
+            entities_by_file.setdefault(node.file_path, []).append(
+                node.identity_key or node.global_uri
+            )
         
         file_dicts = [
             {"file_path": fp, "repo_name": repo_name, "entities": uris}
@@ -902,8 +987,8 @@ def ingest_graph(
                 UNWIND $files AS f
                 MERGE (file:File {path: f.file_path, repo_name: f.repo_name})
                 WITH file, f
-                UNWIND f.entities AS uri
-                MATCH (e:Entity {global_uri: uri})
+                UNWIND f.entities AS identity_key
+                MATCH (e:Entity {identity_key: identity_key})
                 MERGE (e)-[:DEFINED_IN]->(file)
                 """,
                 files=batch,

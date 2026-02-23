@@ -35,6 +35,7 @@ class ExtractedEntity:
     start_line: int
     end_line: int
     is_templated: bool
+    function_sig_hash: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert the entity to a dictionary suitable for JSON serialization.

@@ -116,6 +116,13 @@ class TestGeneratePointId(unittest.TestCase):
         # Should still be deterministic
         self.assertEqual(id1, id2)
 
+    def test_function_sig_hash_changes_point_id(self):
+        """Same join URI with different function signatures must not collide."""
+        uri = "repo::math.cpp::Function::add"
+        id1 = generate_point_id(uri, function_sig_hash="sig_aaaaaaaa")
+        id2 = generate_point_id(uri, function_sig_hash="sig_bbbbbbbb")
+        self.assertNotEqual(id1, id2)
+
 
 class TestBuildEmbedText(unittest.TestCase):
     """Test the _build_embed_text helper."""
@@ -152,6 +159,7 @@ class TestBuildPoint(unittest.TestCase):
         """Set up test entity dictionary."""
         self.entity = {
             "global_uri": "test::file.cpp::Function::foo",
+            "function_sig_hash": "sig_abc12345",
             "repo_name": "test",
             "file_path": "file.cpp",
             "entity_type": "Function",
@@ -193,6 +201,8 @@ class TestBuildPoint(unittest.TestCase):
 
         expected_keys = {
             "global_uri",
+            "identity_key",
+            "function_sig_hash",
             "repo_name",
             "file_path",
             "entity_type",
@@ -206,6 +216,10 @@ class TestBuildPoint(unittest.TestCase):
 
         self.assertEqual(set(point.payload.keys()), expected_keys)
         self.assertEqual(point.payload["global_uri"], self.entity["global_uri"])
+        self.assertEqual(
+            point.payload["identity_key"],
+            "test::file.cpp::Function::foo::sig_abc12345",
+        )
         self.assertEqual(point.payload["entity_type"], "Function")
 
     def test_missing_required_field(self):

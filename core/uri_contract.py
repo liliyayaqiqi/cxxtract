@@ -129,3 +129,29 @@ def parse_global_uri(global_uri: str) -> ParsedGlobalUri:
     if signature_hash is not None:
         payload["signature_hash"] = signature_hash
     return payload
+
+
+def build_identity_key(
+    global_uri: str,
+    function_sig_hash: str | None = None,
+) -> str:
+    """Build an internal identity key that can disambiguate overloads.
+
+    ``global_uri`` remains the cross-store join key.  ``identity_key`` is used
+    internally for systems that require strict uniqueness (e.g., graph MERGE
+    keys or vector point IDs).
+    """
+    sig = function_sig_hash
+    if sig is None:
+        try:
+            parsed = parse_global_uri(global_uri)
+            sig = parsed.get("signature_hash")
+        except ValueError:
+            sig = None
+
+    if not sig:
+        return global_uri
+
+    if global_uri.endswith(f"{GLOBAL_URI_SEPARATOR}{sig}"):
+        return global_uri
+    return f"{global_uri}{GLOBAL_URI_SEPARATOR}{sig}"

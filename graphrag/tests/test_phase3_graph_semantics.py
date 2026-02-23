@@ -108,7 +108,9 @@ class TestPhase3StubAndDedup(unittest.TestCase):
 
         nodes = _build_nodes_from_symbols(symbols, repo_name="phase3-repo")
         self.assertEqual(len(nodes), 2)
-        self.assertEqual(len({n.global_uri for n in nodes}), 2)
+        self.assertEqual(len({n.global_uri for n in nodes}), 1)
+        self.assertEqual(len({n.identity_key for n in nodes}), 2)
+        self.assertEqual(len({n.function_sig_hash for n in nodes}), 2)
         self.assertEqual(len(_dedupe_nodes(nodes)), 2)
 
     def test_cross_repo_stub_completes_with_owner_repo_uri(self) -> None:

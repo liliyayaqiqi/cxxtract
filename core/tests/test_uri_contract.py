@@ -1,6 +1,7 @@
 """Tests for backward-compatible URI contract parsing and function hashes."""
 
 from core.uri_contract import (
+    build_identity_key,
     create_global_uri,
     make_function_signature_hash,
     parse_global_uri,
@@ -36,3 +37,13 @@ def test_make_function_signature_hash_is_stable() -> None:
     h2 = make_function_signature_hash(sig)
     assert h1 == h2
     assert h1.startswith("sig_")
+
+
+def test_build_identity_key_uses_sig_hash_when_present() -> None:
+    key = build_identity_key("repo::a.cpp::Function::foo", "sig_deadbeef")
+    assert key == "repo::a.cpp::Function::foo::sig_deadbeef"
+
+
+def test_build_identity_key_falls_back_to_global_uri() -> None:
+    key = build_identity_key("repo::a.cpp::Class::Foo")
+    assert key == "repo::a.cpp::Class::Foo"

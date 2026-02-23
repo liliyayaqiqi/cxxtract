@@ -341,6 +341,8 @@ def extract_declaration_entity(
     comment_node, code_node, is_templated = get_effective_node_for_extraction(node)
     docstring = get_preceding_comments(comment_node, source_bytes)
     code_text = source_bytes[code_node.start_byte:code_node.end_byte].decode("utf-8")
+    signature_source = _signature_source_from_code_text(code_text)
+    function_sig_hash = make_function_signature_hash(signature_source)
 
     global_uri = ExtractedEntity.create_uri(
         repo_name=repo_name,
@@ -360,6 +362,7 @@ def extract_declaration_entity(
         start_line=code_node.start_point.row + 1,
         end_line=code_node.end_point.row + 1,
         is_templated=is_templated,
+        function_sig_hash=function_sig_hash,
     )
 
 
@@ -470,6 +473,10 @@ def extract_entity_from_node(
         entity_type=entity_type,
         entity_name=qualified_name
     )
+    function_sig_hash: Optional[str] = None
+    if entity_type == "Function":
+        signature_source = _signature_source_from_code_text(code_text)
+        function_sig_hash = make_function_signature_hash(signature_source)
     
     entity = ExtractedEntity(
         global_uri=global_uri,
@@ -481,7 +488,8 @@ def extract_entity_from_node(
         code_text=code_text,
         start_line=start_line,
         end_line=end_line,
-        is_templated=is_templated
+        is_templated=is_templated,
+        function_sig_hash=function_sig_hash,
     )
     
     logger.debug(f"Extracted {entity_type}: {qualified_name} at {file_path}:{start_line}")
@@ -503,7 +511,7 @@ def _signature_source_from_code_text(code_text: str) -> str:
 
 
 def _disambiguate_overloaded_function_uris(entities: List[ExtractedEntity]) -> None:
-    """Ensure overloaded functions in the same scope/file get distinct URIs."""
+    """Stabilize per-function signature hashes for overload disambiguation."""
     groups: dict[tuple[str, str, str, str], list[ExtractedEntity]] = {}
     for entity in entities:
         if entity.entity_type != "Function":
@@ -527,42 +535,28 @@ def _disambiguate_overloaded_function_uris(entities: List[ExtractedEntity]) -> N
             group[0].file_path,
         )
 
-        provisional_uris: list[str] = []
+        provisional_hashes: list[str] = []
         for entity in group:
             signature_source = _signature_source_from_code_text(entity.code_text)
             sig_hash = make_function_signature_hash(signature_source)
-            provisional_uris.append(
-                ExtractedEntity.create_uri(
-                    repo_name=entity.repo_name,
-                    file_path=entity.file_path,
-                    entity_type=entity.entity_type,
-                    entity_name=entity.entity_name,
-                    function_sig_hash=sig_hash,
-                )
-            )
+            provisional_hashes.append(sig_hash)
 
         # If two entries still collide (e.g., declaration+definition with same signature),
-        # add deterministic ordinal salt to keep URIs collision-free.
+        # add deterministic ordinal salt to keep internal identity keys collision-free.
         collisions: dict[str, int] = {}
         for idx, entity in enumerate(group):
-            uri = provisional_uris[idx]
-            seen = collisions.get(uri, 0)
-            collisions[uri] = seen + 1
+            sig_hash = provisional_hashes[idx]
+            seen = collisions.get(sig_hash, 0)
+            collisions[sig_hash] = seen + 1
             if seen == 0:
-                entity.global_uri = uri
+                entity.function_sig_hash = sig_hash
                 continue
 
             signature_source = _signature_source_from_code_text(entity.code_text)
             salted_hash = make_function_signature_hash(
                 f"{signature_source}|duplicate:{seen}",
             )
-            entity.global_uri = ExtractedEntity.create_uri(
-                repo_name=entity.repo_name,
-                file_path=entity.file_path,
-                entity_type=entity.entity_type,
-                entity_name=entity.entity_name,
-                function_sig_hash=salted_hash,
-            )
+            entity.function_sig_hash = salted_hash
 
 
 def traverse_and_extract(

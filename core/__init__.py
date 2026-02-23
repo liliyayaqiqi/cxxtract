@@ -2,6 +2,7 @@
 
 from core.uri_contract import (
     GLOBAL_URI_SEPARATOR,
+    build_identity_key,
     create_global_uri,
     make_function_signature_hash,
     normalize_cpp_entity_name,
@@ -25,6 +26,7 @@ from core.run_artifacts import write_run_report
 
 __all__ = [
     "GLOBAL_URI_SEPARATOR",
+    "build_identity_key",
     "create_global_uri",
     "make_function_signature_hash",
     "normalize_cpp_entity_name",

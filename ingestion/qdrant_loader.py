@@ -17,6 +17,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Iterable, Iterator, List, Dict, Any, Optional, Callable
 
 from qdrant_client import QdrantClient, models
+from core.uri_contract import build_identity_key
 from core.startup_config import (
     load_docker_compose_config,
     resolve_service_port,
@@ -259,6 +260,7 @@ def init_collection(
             # Without these, Qdrant performs full-scan on filtered queries.
             indexed_fields = [
                 "global_uri",
+                "identity_key",
                 "repo_name",
                 "file_path",
                 "entity_type",
@@ -295,16 +297,22 @@ def init_collection(
         raise
 
 
-def generate_point_id(global_uri: str) -> str:
+def generate_point_id(
+    global_uri: str,
+    function_sig_hash: Optional[str] = None,
+    identity_key: Optional[str] = None,
+) -> str:
     """Generate a deterministic UUID for a code entity.
 
-    Uses UUIDv5 with a fixed namespace to ensure the same global_uri
+    Uses UUIDv5 with a fixed namespace to ensure the same identity key
     always produces the same UUID. This enables idempotent upserts —
     re-ingesting the same entity will overwrite the existing point,
     not create duplicates.
 
     Args:
-        global_uri: The unique identifier for the code entity.
+        global_uri: Shared cross-store join key for the entity.
+        function_sig_hash: Optional overload discriminator for functions.
+        identity_key: Optional precomputed identity key.
 
     Returns:
         String representation of UUIDv5.
@@ -315,7 +323,8 @@ def generate_point_id(global_uri: str) -> str:
         >>> id1 == id2  # Same URI always produces same UUID
         True
     """
-    return str(uuid.uuid5(UUID_NAMESPACE, global_uri))
+    stable_key = identity_key or build_identity_key(global_uri, function_sig_hash)
+    return str(uuid.uuid5(UUID_NAMESPACE, stable_key))
 
 
 def _build_embed_text(entity_dict: Dict[str, Any]) -> str:
@@ -365,13 +374,24 @@ def build_point(
         >>> point = build_point(entity, vec)
     """
     global_uri = entity_dict["global_uri"]
+    function_sig_hash = entity_dict.get("function_sig_hash")
+    identity_key = entity_dict.get("identity_key") or build_identity_key(
+        global_uri,
+        function_sig_hash=function_sig_hash,
+    )
 
     # Generate deterministic point ID
-    point_id = generate_point_id(global_uri)
+    point_id = generate_point_id(
+        global_uri,
+        function_sig_hash=function_sig_hash,
+        identity_key=identity_key,
+    )
 
     # Build payload — store ALL entity metadata
     payload = {
         "global_uri": entity_dict["global_uri"],
+        "identity_key": identity_key,
+        "function_sig_hash": function_sig_hash,
         "repo_name": entity_dict["repo_name"],
         "file_path": entity_dict["file_path"],
         "entity_type": entity_dict["entity_type"],
