@@ -77,7 +77,7 @@ def phase1_extract(source_dir: str, repo_name: str, output_file: str) -> int:
     Raises:
         FileNotFoundError: If source_dir does not exist.
     """
-    from extraction.extractor import extract_to_dict_list
+    from extraction.extractor import iter_extract_to_dict_list
 
     logger.info("=" * 80)
     logger.info(" PHASE 1: Extraction & Serialization to Disk")
@@ -93,25 +93,24 @@ def phase1_extract(source_dir: str, repo_name: str, output_file: str) -> int:
 
     # --- Extract ---
     t0 = time.time()
-    entity_dicts = extract_to_dict_list(source_dir, repo_name)
-    extraction_time = time.time() - t0
-    logger.info(f"Extraction completed in {extraction_time:.2f}s — {len(entity_dicts)} entities found")
-
-    # --- Serialize to JSONL ---
+    # --- Serialize to JSONL in streaming mode ---
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
 
     lines_written = 0
     with open(output_file, "w", encoding="utf-8") as f:
-        for entity in entity_dicts:
+        for entity in iter_extract_to_dict_list(source_dir, repo_name):
             f.write(json.dumps(entity, ensure_ascii=False) + "\n")
             lines_written += 1
 
+    extraction_time = time.time() - t0
+    logger.info(
+        "Extraction completed in %.2fs — %d entities found",
+        extraction_time,
+        lines_written,
+    )
+
     logger.info(f"Wrote {lines_written} lines to {output_file}")
-
-    # --- Release in-memory data to simulate memory-safe pipeline ---
-    del entity_dicts
-
-    logger.info("Phase 1 complete. In-memory extraction data released.")
+    logger.info("Phase 1 complete. Streaming extraction path used.")
     logger.info("")
 
     return lines_written

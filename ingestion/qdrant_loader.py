@@ -10,11 +10,12 @@ chunk of entities — by delegating to ``ingestion.embedding.get_embeddings``.
 
 import json
 import logging
+import os
 import time
 import uuid
 import yaml
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Optional, Callable
+from typing import Iterable, Iterator, List, Dict, Any, Optional, Callable
 
 from qdrant_client import QdrantClient, models
 
@@ -26,9 +27,12 @@ from ingestion.config import (
     DEFAULT_VECTOR_DIMENSION,
     DEFAULT_DISTANCE_METRIC,
     DEFAULT_BATCH_SIZE,
+    DEFAULT_MAX_EMBED_CHARS_PER_BATCH,
     UUID_NAMESPACE,
     CONNECTION_RETRIES,
     CONNECTION_RETRY_DELAY,
+    UPSERT_RETRIES,
+    UPSERT_RETRY_BASE_DELAY,
 )
 from ingestion.embedding import get_embeddings
 
@@ -49,6 +53,64 @@ class IngestionStats:
             f"IngestionStats(points={self.points_uploaded}, "
             f"batches={self.batches_sent}, errors={self.errors})"
         )
+
+
+def _extract_vector_size(collection_info: Any) -> Optional[int]:
+    """Extract vector dimension from a Qdrant collection info payload."""
+    vectors = getattr(getattr(collection_info, "config", None), "params", None)
+    vectors = getattr(vectors, "vectors", None)
+    if vectors is None:
+        return None
+
+    # Most common path: VectorParams object with `.size`.
+    size = getattr(vectors, "size", None)
+    if isinstance(size, int):
+        return size
+
+    # Named vectors may be represented as dict-like.
+    if isinstance(vectors, dict):
+        for value in vectors.values():
+            candidate = getattr(value, "size", None)
+            if isinstance(candidate, int):
+                return candidate
+
+    return None
+
+
+def _upsert_with_retries(
+    client: QdrantClient,
+    collection_name: str,
+    points: List[models.PointStruct],
+    max_retries: int = UPSERT_RETRIES,
+    retry_base_delay: float = UPSERT_RETRY_BASE_DELAY,
+) -> bool:
+    """Upsert a batch with bounded exponential backoff retries."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            client.upsert(collection_name=collection_name, points=points)
+            return True
+        except Exception as e:
+            if attempt == max_retries:
+                logger.error(
+                    "Upsert failed after %d attempts for batch size %d: %s",
+                    max_retries,
+                    len(points),
+                    e,
+                )
+                return False
+
+            sleep_seconds = retry_base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "Upsert attempt %d/%d failed for batch size %d: %s. Retrying in %.2fs.",
+                attempt,
+                max_retries,
+                len(points),
+                e,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    return False
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -194,6 +256,14 @@ def init_collection(
                 f"{len(indexed_fields)} payload indices"
             )
         else:
+            collection_info = client.get_collection(collection_name)
+            existing_dimension = _extract_vector_size(collection_info)
+            if existing_dimension is not None and existing_dimension != vector_dimension:
+                raise ValueError(
+                    f"Collection '{collection_name}' dimension mismatch: "
+                    f"existing={existing_dimension}, requested={vector_dimension}. "
+                    "Use recreate=True or provide matching dimension."
+                )
             logger.info(
                 f"Collection '{collection_name}' already exists, skipping creation"
             )
@@ -298,13 +368,98 @@ def build_point(
     )
 
 
+def iter_jsonl_entity_batches(
+    file_path: str,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> Iterator[List[Dict[str, Any]]]:
+    """Stream JSONL entities from disk in bounded batches.
+
+    Args:
+        file_path: Path to JSONL file.
+        batch_size: Number of entities per yielded batch.
+
+    Yields:
+        Batches of parsed entity dictionaries.
+
+    Raises:
+        FileNotFoundError: If file does not exist.
+        json.JSONDecodeError: If any JSONL row is malformed.
+    """
+    current: List[Dict[str, Any]] = []
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                entity = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.error("Invalid JSON on line %d: %s", line_num, e)
+                raise
+
+            current.append(entity)
+            if len(current) >= batch_size:
+                yield current
+                current = []
+
+    if current:
+        yield current
+
+
+def _iter_embedding_batches(
+    entities: Iterable[Dict[str, Any]],
+    stats: IngestionStats,
+    max_entities_per_batch: int,
+    max_chars_per_batch: int,
+) -> Iterator[tuple[List[Dict[str, Any]], List[str]]]:
+    """Yield embedding-ready batches bounded by entity count and char budget."""
+    batch_entities: List[Dict[str, Any]] = []
+    batch_texts: List[str] = []
+    batch_chars = 0
+
+    for entity in entities:
+        try:
+            text = _build_embed_text(entity)
+        except KeyError as e:
+            logger.error(
+                "Missing required field %s in entity %s — skipping",
+                e,
+                entity.get("global_uri", "unknown"),
+            )
+            stats.errors += 1
+            continue
+
+        text_len = len(text)
+        should_flush = (
+            len(batch_entities) >= max_entities_per_batch
+            or (batch_entities and (batch_chars + text_len > max_chars_per_batch))
+        )
+        if should_flush:
+            yield batch_entities, batch_texts
+            batch_entities = []
+            batch_texts = []
+            batch_chars = 0
+
+        batch_entities.append(entity)
+        batch_texts.append(text)
+        batch_chars += text_len
+
+    if batch_entities:
+        yield batch_entities, batch_texts
+
+
 def ingest_entities(
-    entities: List[Dict[str, Any]],
+    entities: Iterable[Dict[str, Any]],
     client: QdrantClient,
     collection_name: str = DEFAULT_COLLECTION_NAME,
     embed_fn: Optional[Callable[[List[str], int], List[List[float]]]] = None,
     dimension: int = DEFAULT_VECTOR_DIMENSION,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    max_embed_chars_per_batch: int = DEFAULT_MAX_EMBED_CHARS_PER_BATCH,
+    upsert_retries: int = UPSERT_RETRIES,
+    upsert_retry_base_delay: float = UPSERT_RETRY_BASE_DELAY,
 ) -> IngestionStats:
     """Ingest code entities into Qdrant with batched embedding and upload.
 
@@ -319,13 +474,17 @@ def ingest_entities(
     4. Upsert the batch to Qdrant.
 
     Args:
-        entities: List of entity dictionaries (from ``ExtractedEntity.to_dict()``).
+        entities: Iterable of entity dictionaries (from ``ExtractedEntity.to_dict()``).
         client: Connected QdrantClient instance.
         collection_name: Target collection name.
         embed_fn: Batch embedding function ``(List[str], int) -> List[List[float]]``.
                  If None, uses ``get_embeddings`` (the config-aware router).
         dimension: Vector dimension for embeddings.
-        batch_size: Number of points to upload per batch.
+        batch_size: Max number of points per embedding/upsert batch.
+        max_embed_chars_per_batch: Soft cap for total characters per embedding
+            request batch.
+        upsert_retries: Number of retry attempts for Qdrant upsert.
+        upsert_retry_base_delay: Base delay for exponential backoff between retries.
 
     Returns:
         IngestionStats with upload metrics.
@@ -340,32 +499,12 @@ def ingest_entities(
         embed_fn = get_embeddings
 
     stats = IngestionStats()
-
-    # Process in batches
-    for i in range(0, len(entities), batch_size):
-        batch = entities[i : i + batch_size]
-
-        # ------------------------------------------------------------------
-        # Step 1: Extract embedding texts for the entire batch
-        # ------------------------------------------------------------------
-        embed_texts: List[str] = []
-        valid_entities: List[Dict[str, Any]] = []
-
-        for entity in batch:
-            try:
-                text = _build_embed_text(entity)
-                embed_texts.append(text)
-                valid_entities.append(entity)
-            except KeyError as e:
-                logger.error(
-                    "Missing required field %s in entity %s — skipping",
-                    e,
-                    entity.get("global_uri", "unknown"),
-                )
-                stats.errors += 1
-
-        if not embed_texts:
-            continue
+    for valid_entities, embed_texts in _iter_embedding_batches(
+        entities=entities,
+        stats=stats,
+        max_entities_per_batch=batch_size,
+        max_chars_per_batch=max_embed_chars_per_batch,
+    ):
 
         # ------------------------------------------------------------------
         # Step 2: Generate embeddings — ONE call per batch
@@ -421,12 +560,13 @@ def ingest_entities(
         # Step 4: Upsert batch to Qdrant
         # ------------------------------------------------------------------
         if batch_points:
-            try:
-                client.upsert(
-                    collection_name=collection_name,
-                    points=batch_points,
-                )
-
+            if _upsert_with_retries(
+                client=client,
+                collection_name=collection_name,
+                points=batch_points,
+                max_retries=upsert_retries,
+                retry_base_delay=upsert_retry_base_delay,
+            ):
                 stats.points_uploaded += len(batch_points)
                 stats.batches_sent += 1
 
@@ -437,8 +577,17 @@ def ingest_entities(
                     stats.points_uploaded,
                 )
 
-            except Exception as e:
-                logger.error("Failed to upsert batch: %s", e)
+            else:
+                uri_preview = [
+                    point.payload.get("global_uri", "unknown")
+                    for point in batch_points[:3]
+                    if point.payload is not None
+                ]
+                logger.error(
+                    "Dropping failed upsert batch of %d points. URI preview: %s",
+                    len(batch_points),
+                    uri_preview,
+                )
                 stats.errors += len(batch_points)
 
     logger.info("Ingestion complete: %s", stats)
@@ -452,11 +601,14 @@ def ingest_from_jsonl(
     embed_fn: Optional[Callable[[List[str], int], List[List[float]]]] = None,
     dimension: int = DEFAULT_VECTOR_DIMENSION,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    max_embed_chars_per_batch: int = DEFAULT_MAX_EMBED_CHARS_PER_BATCH,
+    upsert_retries: int = UPSERT_RETRIES,
+    upsert_retry_base_delay: float = UPSERT_RETRY_BASE_DELAY,
 ) -> IngestionStats:
     """Ingest code entities from a JSONL file into Qdrant.
 
-    Reads a JSONL file (one JSON object per line) where each line represents
-    an entity dictionary, then delegates to ``ingest_entities()``.
+    Streams a JSONL file (one JSON object per line) in bounded chunks and
+    delegates chunk ingestion to ``ingest_entities()``.
 
     Args:
         file_path: Path to JSONL file.
@@ -465,6 +617,10 @@ def ingest_from_jsonl(
         embed_fn: Batch embedding function. If None, uses ``get_embeddings``.
         dimension: Vector dimension for embeddings.
         batch_size: Number of points to upload per batch.
+        max_embed_chars_per_batch: Soft cap for total characters per embedding
+            request batch.
+        upsert_retries: Number of retry attempts for Qdrant upsert.
+        upsert_retry_base_delay: Base delay for exponential backoff between retries.
 
     Returns:
         IngestionStats with upload metrics.
@@ -479,37 +635,30 @@ def ingest_from_jsonl(
     """
     logger.info(f"Reading entities from {file_path}")
 
-    entities: List[Dict[str, Any]] = []
-
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue  # Skip empty lines
-
-                try:
-                    entity = json.loads(line)
-                    entities.append(entity)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON on line {line_num}: {e}")
-                    raise
-
-        logger.info(f"Loaded {len(entities)} entities from {file_path}")
-
-    except FileNotFoundError:
+    if not os.path.isfile(file_path):
         logger.error(f"JSONL file not found: {file_path}")
-        raise
+        raise FileNotFoundError(file_path)
 
-    # Delegate to in-memory ingestion
-    return ingest_entities(
-        entities=entities,
-        client=client,
-        collection_name=collection_name,
-        embed_fn=embed_fn,
-        dimension=dimension,
-        batch_size=batch_size,
-    )
+    aggregate = IngestionStats()
+
+    for entity_batch in iter_jsonl_entity_batches(file_path=file_path, batch_size=batch_size):
+        batch_stats = ingest_entities(
+            entities=entity_batch,
+            client=client,
+            collection_name=collection_name,
+            embed_fn=embed_fn,
+            dimension=dimension,
+            batch_size=batch_size,
+            max_embed_chars_per_batch=max_embed_chars_per_batch,
+            upsert_retries=upsert_retries,
+            upsert_retry_base_delay=upsert_retry_base_delay,
+        )
+        aggregate.points_uploaded += batch_stats.points_uploaded
+        aggregate.batches_sent += batch_stats.batches_sent
+        aggregate.errors += batch_stats.errors
+
+    logger.info("JSONL ingestion complete: %s", aggregate)
+    return aggregate
 
 
 def main() -> None:

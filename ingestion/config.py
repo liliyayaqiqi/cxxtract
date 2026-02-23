@@ -31,6 +31,9 @@ DEFAULT_COLLECTION_NAME: str = "code_embeddings"
 DEFAULT_VECTOR_DIMENSION: int = 1536  # Matches OpenAI text-embedding-3-small
 DEFAULT_DISTANCE_METRIC = models.Distance.COSINE
 DEFAULT_BATCH_SIZE: int = 100
+# Soft budget for batching embedding requests by character volume.
+# Keeps request payloads bounded even when entity count is small.
+DEFAULT_MAX_EMBED_CHARS_PER_BATCH: int = 160000
 
 # ---------------------------------------------------------------------------
 # UUIDv5 namespace for deterministic ID generation
@@ -43,6 +46,8 @@ UUID_NAMESPACE: uuid.UUID = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 # ---------------------------------------------------------------------------
 CONNECTION_RETRIES: int = 3
 CONNECTION_RETRY_DELAY: float = 2.0  # seconds
+UPSERT_RETRIES: int = 3
+UPSERT_RETRY_BASE_DELAY: float = 1.0  # seconds
 
 # ---------------------------------------------------------------------------
 # OpenRouter / Embedding API configuration

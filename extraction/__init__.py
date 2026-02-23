@@ -11,6 +11,8 @@ from extraction.traversal import extract_entities_from_tree
 from extraction.extractor import (
     extract_file,
     extract_directory,
+    iter_extract_entities,
+    iter_extract_to_dict_list,
     extract_to_dict_list,
     discover_cpp_files,
     ExtractionStats,
@@ -30,6 +32,8 @@ __all__ = [
     # High-level orchestration
     "extract_file",
     "extract_directory",
+    "iter_extract_entities",
+    "iter_extract_to_dict_list",
     "extract_to_dict_list",
     "discover_cpp_files",
 ]

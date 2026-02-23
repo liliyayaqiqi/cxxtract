@@ -26,6 +26,7 @@ from ingestion.qdrant_loader import (
     _build_embed_text,
     ingest_entities,
     ingest_from_jsonl,
+    iter_jsonl_entity_batches,
     get_qdrant_client,
     init_collection,
     IngestionStats,
@@ -403,6 +404,61 @@ class TestIngestEntities(unittest.TestCase):
         self.assertIn("/// Function 0", captured_texts[0][0])
         self.assertIn("void func0() {}", captured_texts[0][0])
 
+    def test_embedding_batches_split_by_char_budget(self):
+        """Test batch splitting by character budget even with large batch_size."""
+        long_entities = [
+            {
+                "global_uri": f"test::test.cpp::Function::f{i}",
+                "repo_name": "test",
+                "file_path": "test.cpp",
+                "entity_type": "Function",
+                "entity_name": f"f{i}",
+                "docstring": None,
+                "code_text": "x" * 60,
+                "start_line": i,
+                "end_line": i + 1,
+                "is_templated": False,
+            }
+            for i in range(3)
+        ]
+
+        mock_embed = Mock(side_effect=lambda texts, dim: [[0.0] * dim for _ in texts])
+        mock_client = Mock()
+
+        stats = ingest_entities(
+            long_entities,
+            mock_client,
+            embed_fn=mock_embed,
+            dimension=16,
+            batch_size=100,  # would normally be one batch
+            max_embed_chars_per_batch=100,  # force split
+        )
+
+        # 60 + 60 exceeds 100, so 3 entities become 3 batches.
+        self.assertEqual(mock_embed.call_count, 3)
+        self.assertEqual(stats.batches_sent, 3)
+        self.assertEqual(stats.points_uploaded, 3)
+
+    def test_upsert_retries_then_succeeds(self):
+        """Test that transient upsert failures are retried."""
+        mock_embed = Mock(side_effect=lambda texts, dim: [[0.0] * dim for _ in texts])
+        mock_client = Mock()
+        mock_client.upsert.side_effect = [RuntimeError("temporary"), None]
+
+        stats = ingest_entities(
+            self.entities[:1],
+            mock_client,
+            embed_fn=mock_embed,
+            dimension=16,
+            batch_size=10,
+            upsert_retries=2,
+            upsert_retry_base_delay=0.0,
+        )
+
+        self.assertEqual(mock_client.upsert.call_count, 2)
+        self.assertEqual(stats.points_uploaded, 1)
+        self.assertEqual(stats.errors, 0)
+
 
 class TestIngestFromJsonl(unittest.TestCase):
     """Test JSONL file ingestion."""
@@ -487,6 +543,38 @@ class TestIngestFromJsonl(unittest.TestCase):
         try:
             with self.assertRaises(json.JSONDecodeError):
                 ingest_from_jsonl(temp_path, client)
+        finally:
+            os.unlink(temp_path)
+
+
+class TestJsonlStreamingIterator(unittest.TestCase):
+    """Test streaming JSONL batch iterator utility."""
+
+    def test_iter_jsonl_entity_batches_chunks_by_size(self):
+        entities = [{"global_uri": f"u{i}", "code_text": "x"} for i in range(5)]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            for entity in entities:
+                f.write(json.dumps(entity) + "\n")
+            temp_path = f.name
+
+        try:
+            batches = list(iter_jsonl_entity_batches(temp_path, batch_size=2))
+            self.assertEqual(len(batches), 3)
+            self.assertEqual(len(batches[0]), 2)
+            self.assertEqual(len(batches[1]), 2)
+            self.assertEqual(len(batches[2]), 1)
+        finally:
+            os.unlink(temp_path)
+
+    def test_iter_jsonl_entity_batches_malformed_raises(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write('{"global_uri":"ok","code_text":"x"}\n')
+            f.write("{bad}\n")
+            temp_path = f.name
+
+        try:
+            with self.assertRaises(json.JSONDecodeError):
+                list(iter_jsonl_entity_batches(temp_path, batch_size=10))
         finally:
             os.unlink(temp_path)
 
@@ -593,6 +681,30 @@ class TestInitCollection(unittest.TestCase):
         self.assertTrue(client.collection_exists(collection_name))
 
         client.delete_collection(collection_name)
+
+    def test_init_collection_dimension_mismatch_raises(self):
+        """Test that existing collection dimension mismatch raises ValueError."""
+        mock_client = Mock()
+        mock_client.collection_exists.return_value = True
+
+        # Build nested mock matching get_collection().config.params.vectors.size
+        vectors = Mock()
+        vectors.size = 128
+        params = Mock()
+        params.vectors = vectors
+        config = Mock()
+        config.params = params
+        collection_info = Mock()
+        collection_info.config = config
+        mock_client.get_collection.return_value = collection_info
+
+        with self.assertRaises(ValueError):
+            init_collection(
+                mock_client,
+                collection_name="existing_collection",
+                vector_dimension=256,
+                recreate=False,
+            )
 
 
 class TestEndToEndIntegration(unittest.TestCase):

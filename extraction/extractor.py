@@ -8,7 +8,7 @@ single files or entire directory trees.
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import Iterator, List, Optional, Dict, Any
 
 from extraction.config import (
     CPP_EXTENSIONS,
@@ -291,6 +291,104 @@ def extract_directory(
     return all_entities, stats
 
 
+def iter_extract_entities(
+    source: str,
+    repo_name: str,
+    repo_root: Optional[str] = None,
+    continue_on_error: bool = True,
+    include_declarations: bool = DEFAULT_INCLUDE_DECLARATIONS,
+    extern_c_declarations: bool = DEFAULT_EXTERN_C_DECLARATIONS,
+) -> Iterator[ExtractedEntity]:
+    """Stream extracted entities from a file or directory.
+
+    This iterator-based API avoids materializing all entities in memory.
+
+    Args:
+        source: Path to a file or directory.
+        repo_name: Repository name for URI generation.
+        repo_root: Repository root directory.
+        continue_on_error: If True, skip problematic files and continue.
+        include_declarations: Whether to extract declaration-only functions.
+        extern_c_declarations: Whether to include declaration-only functions
+            inside extern "C" blocks.
+
+    Yields:
+        ExtractedEntity items as they are produced.
+    """
+    source = os.path.abspath(source)
+
+    if os.path.isfile(source):
+        diagnostics = _extract_file_with_diagnostics(
+            file_path=source,
+            repo_name=repo_name,
+            repo_root=repo_root,
+            include_declarations=include_declarations,
+            extern_c_declarations=extern_c_declarations,
+        )
+        for entity in diagnostics.entities:
+            yield entity
+        return
+
+    if not os.path.isdir(source):
+        raise FileNotFoundError(f"Source not found: {source}")
+
+    if repo_root is None:
+        resolved_repo_root = source
+    else:
+        resolved_repo_root = os.path.abspath(repo_root)
+
+    cpp_files = discover_cpp_files(source)
+    for file_path in cpp_files:
+        try:
+            diagnostics = _extract_file_with_diagnostics(
+                file_path=file_path,
+                repo_name=repo_name,
+                repo_root=resolved_repo_root,
+                include_declarations=include_declarations,
+                extern_c_declarations=extern_c_declarations,
+            )
+            for entity in diagnostics.entities:
+                yield entity
+        except Exception:
+            if continue_on_error:
+                logger.exception("Streaming extraction failed for %s", file_path)
+                continue
+            raise
+
+
+def iter_extract_to_dict_list(
+    source: str,
+    repo_name: str,
+    repo_root: Optional[str] = None,
+    continue_on_error: bool = True,
+    include_declarations: bool = DEFAULT_INCLUDE_DECLARATIONS,
+    extern_c_declarations: bool = DEFAULT_EXTERN_C_DECLARATIONS,
+) -> Iterator[Dict[str, Any]]:
+    """Stream extracted entities as JSON-serializable dictionaries.
+
+    Args:
+        source: Path to a file or directory.
+        repo_name: Repository name for URI generation.
+        repo_root: Repository root directory.
+        continue_on_error: If True, skip problematic files and continue.
+        include_declarations: Whether to extract declaration-only functions.
+        extern_c_declarations: Whether to include declaration-only functions
+            inside extern "C" blocks.
+
+    Yields:
+        Entity dictionaries.
+    """
+    for entity in iter_extract_entities(
+        source=source,
+        repo_name=repo_name,
+        repo_root=repo_root,
+        continue_on_error=continue_on_error,
+        include_declarations=include_declarations,
+        extern_c_declarations=extern_c_declarations,
+    ):
+        yield entity.to_dict()
+
+
 def extract_to_dict_list(
     source: str,
     repo_name: str,
@@ -320,26 +418,13 @@ def extract_to_dict_list(
         >>> import json
         >>> json.dump(entities, open("entities.json", "w"), indent=2)
     """
-    source = os.path.abspath(source)
-    
-    if os.path.isfile(source):
-        entities = extract_file(
-            source,
-            repo_name,
-            repo_root,
+    return list(
+        iter_extract_to_dict_list(
+            source=source,
+            repo_name=repo_name,
+            repo_root=repo_root,
+            continue_on_error=True,
             include_declarations=include_declarations,
             extern_c_declarations=extern_c_declarations,
         )
-    elif os.path.isdir(source):
-        entities, stats = extract_directory(
-            source,
-            repo_name,
-            repo_root,
-            include_declarations=include_declarations,
-            extern_c_declarations=extern_c_declarations,
-        )
-        logger.info(f"Extraction stats: {stats}")
-    else:
-        raise FileNotFoundError(f"Source not found: {source}")
-    
-    return [entity.to_dict() for entity in entities]
+    )
