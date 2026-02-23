@@ -371,6 +371,7 @@ def _build_nodes_from_symbols(
             sym.file_path,
             repo_name,
             sym.kind,
+            include_function_sig=True,
         )
         
         if global_uri is None:
@@ -435,6 +436,7 @@ def _build_edges_from_relationships(
             sym.file_path,
             repo_name,
             sym.kind,
+            include_function_sig=True,
         )
         
         if src_uri is None:
@@ -467,6 +469,7 @@ def _build_edges_from_relationships(
                 tgt_file_path,
                 repo_name,
                 kind=tgt_kind,
+                include_function_sig=True,
             )
             
             if tgt_uri is None:
@@ -575,6 +578,7 @@ def _build_edges_from_references(
             enclosing_file,
             repo_name,
             kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
+            include_function_sig=True,
         )
         
         if src_uri is None:
@@ -603,6 +607,7 @@ def _build_edges_from_references(
             tgt_file,
             repo_name,
             kind=tgt_kind,
+            include_function_sig=True,
         )
         
         if tgt_uri is None:

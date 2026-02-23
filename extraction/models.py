@@ -50,7 +50,9 @@ class ExtractedEntity:
         repo_name: str,
         file_path: str,
         entity_type: str,
-        entity_name: str
+        entity_name: str,
+        function_signature: str | None = None,
+        function_sig_hash: str | None = None,
     ) -> str:
         """Build a Global URI from components.
         
@@ -59,6 +61,8 @@ class ExtractedEntity:
             file_path: File path relative to repo root
             entity_type: Entity type (Class, Struct, Function)
             entity_name: Qualified entity name
+            function_signature: Optional function signature text.
+            function_sig_hash: Optional precomputed function signature hash.
             
         Returns:
             Global URI string in format RepoName::FilePath::EntityType::EntityName
@@ -68,4 +72,6 @@ class ExtractedEntity:
             file_path=file_path,
             entity_type=entity_type,
             entity_name=entity_name,
+            function_signature=function_signature,
+            function_sig_hash=function_sig_hash,
         )

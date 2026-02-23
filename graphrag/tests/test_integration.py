@@ -2,7 +2,13 @@
 Integration tests for the complete GraphRAG pipeline.
 
 Tests the full workflow: SCIP parsing -> Neo4j ingestion -> Blast radius queries.
-Requires yaml-cpp SCIP index and Neo4j running.
+Requires a SCIP index and Neo4j running.
+
+To run with an external SCIP file:
+    SCIP_INDEX_PATH=/abs/path/to/index.scip pytest -q -m external
+
+Example index generation:
+    scip-clang --compdb-path /path/to/compile_commands.json --index-path output/index.scip
 """
 
 import unittest
@@ -29,7 +35,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.external]
 
 def _discover_scip_index_path() -> str | None:
     """Discover SCIP index path from env/workspace candidates."""
-    env_path = os.getenv("GRAPHRAG_TEST_SCIP_INDEX")
+    env_path = os.getenv("SCIP_INDEX_PATH") or os.getenv("GRAPHRAG_TEST_SCIP_INDEX")
     candidates = []
     if env_path:
         candidates.append(Path(env_path))
@@ -50,7 +56,8 @@ class TestEndToEndPipeline(unittest.TestCase):
         cls.index_path = _discover_scip_index_path()
         if cls.index_path is None:
             raise unittest.SkipTest(
-                "SCIP index not available. Set GRAPHRAG_TEST_SCIP_INDEX or "
+                "SCIP index not available. Set SCIP_INDEX_PATH (preferred) or "
+                "GRAPHRAG_TEST_SCIP_INDEX, or "
                 "provide output/index.scip."
             )
         

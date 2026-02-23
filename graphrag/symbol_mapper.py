@@ -27,14 +27,20 @@ Example mappings:
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-from core.uri_contract import create_global_uri, normalize_cpp_entity_name
+from core.uri_contract import (
+    create_global_uri,
+    make_function_signature_hash,
+    normalize_cpp_entity_name,
+)
 from graphrag.config import IGNORED_NAMESPACES, MONITORED_NAMESPACES
 from graphrag.proto import scip_pb2
 
 logger = logging.getLogger(__name__)
+_SCIP_DISAMBIG_RE = re.compile(r"^[0-9a-zA-Z_-]{4,64}$")
 
 # ---------------------------------------------------------------------------
 # SCIP SymbolInformation.Kind enum values (source of truth: generated pb2)
@@ -107,6 +113,7 @@ class ParsedScipSymbol:
     package_manager: str
     package_name: str
     package_version: str
+    function_sig_hash: Optional[str]
     is_external: bool
     is_local: bool
     is_macro: bool
@@ -163,6 +170,7 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
     entity_type: Optional[str] = None
     final_name: Optional[str] = None
     is_macro = False
+    function_sig_hash: Optional[str] = None
     
     # Walk through descriptor_str character by character
     i = 0
@@ -204,6 +212,7 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
             i += 1
             while i < len(descriptor_str) and descriptor_str[i] != ")":
                 i += 1
+            disambiguator = descriptor_str[paren_start + 1 : i]
             i += 1  # Skip )
             
             # Expect . after )
@@ -212,6 +221,12 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
                 # This is a method/function
                 final_name = name
                 entity_type = "Function"
+                if disambiguator:
+                    lowered = disambiguator.lower()
+                    if _SCIP_DISAMBIG_RE.match(lowered):
+                        function_sig_hash = f"sig_{lowered}"
+                    else:
+                        function_sig_hash = make_function_signature_hash(disambiguator)
                 break
         elif suffix == "/":
             # Namespace
@@ -303,6 +318,7 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
         package_manager=manager,
         package_name=pkg_name,
         package_version=version,
+        function_sig_hash=function_sig_hash,
         is_external=is_external,
         is_local=False,
         is_macro=False,
@@ -385,6 +401,7 @@ def scip_symbol_to_global_uri(
     file_path: str,
     repo_name: str,
     kind: int = 0,
+    include_function_sig: bool = False,
 ) -> Optional[str]:
     """Convert a SCIP symbol to a Global URI.
     
@@ -398,6 +415,8 @@ def scip_symbol_to_global_uri(
         file_path: Document.relative_path from SCIP.
         repo_name: Repository name.
         kind: SymbolInformation.Kind enum value.
+        include_function_sig: If True, include function signature discriminator
+            from SCIP method disambiguator in Function URIs.
         
     Returns:
         Global URI string, or None if symbol should be skipped.
@@ -426,6 +445,11 @@ def scip_symbol_to_global_uri(
         file_path=file_path,
         entity_type=parsed.entity_type,
         entity_name=parsed.entity_name,
+        function_sig_hash=(
+            parsed.function_sig_hash
+            if include_function_sig and parsed.entity_type == "Function"
+            else None
+        ),
     )
 
 

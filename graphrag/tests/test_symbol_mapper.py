@@ -296,6 +296,17 @@ class TestScipSymbolToGlobalUri(unittest.TestCase):
             uri,
             "yaml-cpp::src/binary.cpp::Function::YAML::EncodeBase64"
         )
+
+    def test_function_uri_with_signature_discriminator_opt_in(self):
+        """Function URI can include signature hash token when requested."""
+        uri = scip_symbol_to_global_uri(
+            "cxx . . $ YAML/EncodeBase64(556d3a62ec161185).",
+            "src/binary.cpp",
+            "yaml-cpp",
+            kind=0,
+            include_function_sig=True,
+        )
+        self.assertIn("::Function::YAML::EncodeBase64::sig_556d3a62ec161185", uri)
     
     def test_external_symbol_uri(self):
         """Test Global URI for external symbol."""

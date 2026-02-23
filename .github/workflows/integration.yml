@@ -50,6 +50,6 @@ jobs:
       - name: Run External Dataset Integration Suite
         if: ${{ inputs.include_external }}
         env:
-          GRAPHRAG_TEST_SCIP_INDEX: ${{ secrets.GRAPHRAG_TEST_SCIP_INDEX }}
+          SCIP_INDEX_PATH: ${{ secrets.SCIP_INDEX_PATH }}
           GRAPHRAG_TEST_REPO_NAME: ci-external-repo
         run: pytest -q -m external

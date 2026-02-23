@@ -6,10 +6,11 @@ This module provides functions to traverse the C++ AST and extract entities
 """
 
 import logging
+import re
 from typing import List, Optional, Tuple
 from tree_sitter import Node, Tree
 
-from core.uri_contract import normalize_cpp_entity_name
+from core.uri_contract import make_function_signature_hash, normalize_cpp_entity_name
 from extraction.config import (
     TARGET_ENTITY_TYPES,
     TEMPLATE_WRAPPER,
@@ -27,6 +28,7 @@ from extraction.config import (
 from extraction.models import ExtractedEntity
 
 logger = logging.getLogger(__name__)
+_SPACE_RE = re.compile(r"\s+")
 
 
 def is_doxygen_comment(comment_text: str) -> bool:
@@ -486,6 +488,83 @@ def extract_entity_from_node(
     return entity
 
 
+def _signature_source_from_code_text(code_text: str) -> str:
+    """Derive a stable signature source string from function code text."""
+    text = code_text.strip()
+    brace_idx = text.find("{")
+    semi_idx = text.find(";")
+    cut_idx = -1
+    candidates = [idx for idx in (brace_idx, semi_idx) if idx >= 0]
+    if candidates:
+        cut_idx = min(candidates)
+    if cut_idx >= 0:
+        text = text[:cut_idx]
+    return _SPACE_RE.sub(" ", text).strip()
+
+
+def _disambiguate_overloaded_function_uris(entities: List[ExtractedEntity]) -> None:
+    """Ensure overloaded functions in the same scope/file get distinct URIs."""
+    groups: dict[tuple[str, str, str, str], list[ExtractedEntity]] = {}
+    for entity in entities:
+        if entity.entity_type != "Function":
+            continue
+        key = (
+            entity.repo_name,
+            entity.file_path,
+            entity.entity_type,
+            entity.entity_name,
+        )
+        groups.setdefault(key, []).append(entity)
+
+    for group in groups.values():
+        if len(group) <= 1:
+            continue
+
+        logger.info(
+            "Detected %d overload candidates for function '%s' in %s",
+            len(group),
+            group[0].entity_name,
+            group[0].file_path,
+        )
+
+        provisional_uris: list[str] = []
+        for entity in group:
+            signature_source = _signature_source_from_code_text(entity.code_text)
+            sig_hash = make_function_signature_hash(signature_source)
+            provisional_uris.append(
+                ExtractedEntity.create_uri(
+                    repo_name=entity.repo_name,
+                    file_path=entity.file_path,
+                    entity_type=entity.entity_type,
+                    entity_name=entity.entity_name,
+                    function_sig_hash=sig_hash,
+                )
+            )
+
+        # If two entries still collide (e.g., declaration+definition with same signature),
+        # add deterministic ordinal salt to keep URIs collision-free.
+        collisions: dict[str, int] = {}
+        for idx, entity in enumerate(group):
+            uri = provisional_uris[idx]
+            seen = collisions.get(uri, 0)
+            collisions[uri] = seen + 1
+            if seen == 0:
+                entity.global_uri = uri
+                continue
+
+            signature_source = _signature_source_from_code_text(entity.code_text)
+            salted_hash = make_function_signature_hash(
+                f"{signature_source}|duplicate:{seen}",
+            )
+            entity.global_uri = ExtractedEntity.create_uri(
+                repo_name=entity.repo_name,
+                file_path=entity.file_path,
+                entity_type=entity.entity_type,
+                entity_name=entity.entity_name,
+                function_sig_hash=salted_hash,
+            )
+
+
 def traverse_and_extract(
     node: Node,
     source_bytes: bytes,
@@ -701,5 +780,6 @@ def extract_entities_from_tree(
         include_declarations=include_declarations,
         extern_c_declarations=extern_c_declarations,
     )
+    _disambiguate_overloaded_function_uris(entities)
     logger.info(f"Extracted {len(entities)} entities from {file_path}")
     return entities

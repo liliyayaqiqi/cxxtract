@@ -10,6 +10,7 @@ ignored namespaces (std::, boost::, etc.) never enter the pipeline.
 """
 
 import logging
+import heapq
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -119,8 +120,21 @@ def _collect_definition_ranges(doc: scip_pb2.Document) -> dict[str, tuple[int, i
     return ranges
 
 
+def _collect_index_definition_symbols(index: scip_pb2.Index) -> set[str]:
+    """Collect symbols that are locally defined via Definition occurrences."""
+    symbols: set[str] = set()
+    for doc in index.documents:
+        for occ in doc.occurrences:
+            if not occ.symbol or occ.symbol.startswith("local "):
+                continue
+            if occ.symbol_roles & 0x1:
+                symbols.add(occ.symbol)
+    return symbols
+
+
 def _build_enclosing_scope_map(
     doc: scip_pb2.Document,
+    reference_lines: Optional[set[int]] = None,
 ) -> dict[int, str]:
     """Build a line -> enclosing definition symbol map.
     
@@ -129,13 +143,13 @@ def _build_enclosing_scope_map(
     
     Args:
         doc: SCIP Document message.
+        reference_lines: Optional set of line numbers that require lookup.
+            When provided, resolves only those lines via sweep-line logic.
         
     Returns:
         Dict mapping line numbers to the SCIP symbol that defines that scope.
     """
-    # line -> (span_width, start_line, symbol)
-    scope_map: dict[int, tuple[int, int, str]] = {}
-
+    spans: list[tuple[int, int, int, str]] = []  # (start, end, width, symbol)
     for occ in doc.occurrences:
         # Check if this is a definition
         is_def = (occ.symbol_roles & 0x1) > 0
@@ -149,22 +163,41 @@ def _build_enclosing_scope_map(
 
         start_line, end_line = bounds
         span_width = max(0, end_line - start_line)
+        spans.append((start_line, end_line, span_width, occ.symbol))
 
-        # Map lines to the narrowest enclosing definition.
-        # Tie-breaker: later start_line wins (typically deeper nested).
-        for line in range(start_line, end_line + 1):
-            existing = scope_map.get(line)
-            if existing is None:
-                scope_map[line] = (span_width, start_line, occ.symbol)
-                continue
+    if reference_lines is None:
+        # Fallback: derive query lines from non-definition occurrences.
+        reference_lines = {
+            occ.range[0]
+            for occ in doc.occurrences
+            if len(occ.range) >= 3 and not (occ.symbol_roles & 0x1)
+        }
 
-            existing_width, existing_start, _ = existing
-            if span_width < existing_width or (
-                span_width == existing_width and start_line > existing_start
-            ):
-                scope_map[line] = (span_width, start_line, occ.symbol)
+    if not spans or not reference_lines:
+        return {}
 
-    return {line: data[2] for line, data in scope_map.items()}
+    spans.sort(key=lambda item: item[0])
+    sorted_lines = sorted(reference_lines)
+
+    # Heap key: (span_width ASC, -start_line ASC => deeper scope first, symbol ASC).
+    active: list[tuple[int, int, str, int]] = []  # (width, -start, symbol, end)
+    scope_map: dict[int, str] = {}
+
+    span_idx = 0
+    for line in sorted_lines:
+        while span_idx < len(spans) and spans[span_idx][0] <= line:
+            start, end, width, symbol = spans[span_idx]
+            heapq.heappush(active, (width, -start, symbol, end))
+            span_idx += 1
+
+        # Drop expired intervals.
+        while active and active[0][3] < line:
+            heapq.heappop(active)
+
+        if active:
+            scope_map[line] = active[0][2]
+
+    return scope_map
 
 
 def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
@@ -201,19 +234,19 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
     dropped_syms = 0
     dropped_refs = 0
 
-    local_definition_symbols: set[str] = {
-        sym_info.symbol
-        for doc in index.documents
-        for sym_info in doc.symbols
-        if sym_info.symbol and not sym_info.symbol.startswith("local ")
-    }
+    local_definition_symbols = _collect_index_definition_symbols(index)
     
     # Process each document
     for doc in index.documents:
         file_path = doc.relative_path
         
-        # Build enclosing scope map for this document
-        scope_map = _build_enclosing_scope_map(doc)
+        reference_lines = {
+            occ.range[0]
+            for occ in doc.occurrences
+            if len(occ.range) >= 3 and not (occ.symbol_roles & 0x1)
+        }
+        # Build enclosing scope map for this document.
+        scope_map = _build_enclosing_scope_map(doc, reference_lines=reference_lines)
         definition_ranges = _collect_definition_ranges(doc)
         
         # Extract symbol definitions
@@ -226,11 +259,13 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
             disposition = classify_symbol(
                 sym_info.symbol,
                 sym_info.kind,
-                is_local_definition=True,
+                is_local_definition=(sym_info.symbol in local_definition_symbols),
             )
             if disposition == "drop":
                 dropped_syms += 1
                 continue
+            if disposition == "stub":
+                logger.debug("Treating symbol as stub (non-local definition): %s", sym_info.symbol)
             
             # Extract relationships, filtering targets too
             rels: list[ScipRelationship] = []
@@ -241,6 +276,12 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
                 )
                 if tgt_disp == "drop":
                     continue
+                if tgt_disp == "stub":
+                    logger.debug(
+                        "Treating relationship target as stub: src=%s target=%s",
+                        sym_info.symbol,
+                        rel.symbol,
+                    )
                 rels.append(
                     ScipRelationship(
                         target_symbol=rel.symbol,
@@ -272,12 +313,16 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
                 continue
             
             # Smart filtering: drop references TO ignored namespaces
-            if should_drop_symbol(
+            occ_local = occ.symbol in local_definition_symbols
+            occ_disp = classify_symbol(
                 occ.symbol,
-                is_local_definition=(occ.symbol in local_definition_symbols),
-            ):
+                is_local_definition=occ_local,
+            )
+            if occ_disp == "drop":
                 dropped_refs += 1
                 continue
+            if occ_disp == "stub":
+                logger.debug("Reference target resolved as stub: %s", occ.symbol)
             
             # Also drop references FROM ignored enclosing symbols
             line = occ.range[0] if len(occ.range) >= 3 else -1
