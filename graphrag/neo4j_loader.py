@@ -26,6 +26,7 @@ from graphrag.symbol_mapper import (
     scip_symbol_to_global_uri,
     classify_symbol,
     parse_scip_symbol,
+    resolve_symbol_owner_repo,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class GraphNode:
     entity_name: str
     scip_symbol: str
     is_external: bool
+    ingestion_repo: Optional[str] = None
+    owner_repo: Optional[str] = None
 
 
 @dataclass
@@ -362,14 +365,22 @@ def _build_nodes_from_symbols(
     nodes: list[GraphNode] = []
     
     for sym in symbols:
-        # classify_symbol already applied in parser, but symbols that
-        # survived parsing are either "keep" or "stub" at definition site.
-        # The symbol was defined in this repo's index, so it is "keep".
+        is_stub_symbol = sym.disposition == "stub"
+        owner_repo = (
+            resolve_symbol_owner_repo(
+                sym.scip_symbol,
+                current_repo_name=repo_name,
+                kind=sym.kind,
+            )
+            if is_stub_symbol
+            else repo_name
+        )
+        uri_file_path = "<external>" if is_stub_symbol else sym.file_path
         
         global_uri = scip_symbol_to_global_uri(
             sym.scip_symbol,
-            sym.file_path,
-            repo_name,
+            uri_file_path,
+            owner_repo,
             sym.kind,
             include_function_sig=True,
         )
@@ -386,12 +397,14 @@ def _build_nodes_from_symbols(
         nodes.append(
             GraphNode(
                 global_uri=global_uri,
-                repo_name=repo_name,
-                file_path=sym.file_path,
+                repo_name=owner_repo,
+                file_path=uri_file_path,
                 entity_type=parsed_uri["entity_type"],
                 entity_name=parsed_uri["entity_name"],
                 scip_symbol=sym.scip_symbol,
-                is_external=False,  # Defined in this repo's SCIP index
+                is_external=is_stub_symbol,
+                ingestion_repo=repo_name,
+                owner_repo=owner_repo,
             )
         )
     
@@ -458,16 +471,29 @@ def _build_edges_from_relationships(
             # SCIP relationships do NOT carry the target's file path;
             # only the raw symbol string.  We must look it up.
             if tgt_disposition == "stub":
-                tgt_file_path = "<external>"
+                tgt_file_path = symbol_file_map.get(rel.target_symbol, "<external>")
+                tgt_repo_name = resolve_symbol_owner_repo(
+                    rel.target_symbol,
+                    current_repo_name=repo_name,
+                    kind=tgt_kind,
+                )
+                if tgt_repo_name != repo_name:
+                    logger.debug(
+                        "Resolved stub owner repo via namespace mapping: symbol=%s ingestion_repo=%s owner_repo=%s",
+                        rel.target_symbol,
+                        repo_name,
+                        tgt_repo_name,
+                    )
             else:
                 tgt_file_path = symbol_file_map.get(
                     rel.target_symbol, sym.file_path
                 )
+                tgt_repo_name = repo_name
             
             tgt_uri = scip_symbol_to_global_uri(
                 rel.target_symbol,
                 tgt_file_path,
-                repo_name,
+                tgt_repo_name,
                 kind=tgt_kind,
                 include_function_sig=True,
             )
@@ -484,12 +510,14 @@ def _build_edges_from_relationships(
                     stub_nodes.append(
                         GraphNode(
                             global_uri=tgt_uri,
-                            repo_name=repo_name,
-                            file_path="<external>",
+                            repo_name=tgt_repo_name,
+                            file_path=tgt_file_path,
                             entity_type=parsed_tgt.entity_type,
                             entity_name=parsed_tgt.entity_name,
                             scip_symbol=rel.target_symbol,
                             is_external=True,
+                            ingestion_repo=repo_name,
+                            owner_repo=tgt_repo_name,
                         )
                     )
             
@@ -598,14 +626,27 @@ def _build_edges_from_references(
         # ref.file_path is where the reference *occurs*, NOT where
         # the target is defined — those are usually different files.
         if tgt_disposition == "stub":
-            tgt_file = "<external>"
+            tgt_file = symbol_file_map.get(ref.scip_symbol, "<external>")
+            tgt_repo_name = resolve_symbol_owner_repo(
+                ref.scip_symbol,
+                current_repo_name=repo_name,
+                kind=tgt_kind,
+            )
+            if tgt_repo_name != repo_name:
+                logger.debug(
+                    "Resolved reference stub owner repo via namespace mapping: symbol=%s ingestion_repo=%s owner_repo=%s",
+                    ref.scip_symbol,
+                    repo_name,
+                    tgt_repo_name,
+                )
         else:
             tgt_file = symbol_file_map.get(ref.scip_symbol, ref.file_path)
+            tgt_repo_name = repo_name
         
         tgt_uri = scip_symbol_to_global_uri(
             ref.scip_symbol,
             tgt_file,
-            repo_name,
+            tgt_repo_name,
             kind=tgt_kind,
             include_function_sig=True,
         )
@@ -622,12 +663,14 @@ def _build_edges_from_references(
                 stub_nodes.append(
                     GraphNode(
                         global_uri=tgt_uri,
-                        repo_name=repo_name,
-                        file_path="<external>",
+                        repo_name=tgt_repo_name,
+                        file_path=tgt_file,
                         entity_type=parsed_tgt.entity_type,
                         entity_name=parsed_tgt.entity_name,
                         scip_symbol=ref.scip_symbol,
                         is_external=True,
+                        ingestion_repo=repo_name,
+                        owner_repo=tgt_repo_name,
                     )
                 )
         
@@ -753,6 +796,8 @@ def ingest_graph(
                     {
                         "global_uri": n.global_uri,
                         "repo_name": n.repo_name,
+                        "ingestion_repo": n.ingestion_repo or repo_name,
+                        "owner_repo": n.owner_repo or n.repo_name,
                         "file_path": n.file_path,
                         "entity_type": n.entity_type,
                         "entity_name": n.entity_name,
@@ -768,6 +813,8 @@ def ingest_graph(
                     UNWIND $nodes AS n
                     MERGE (e:Entity:{entity_type} {{global_uri: n.global_uri}})
                     SET e.repo_name = n.repo_name,
+                        e.ingestion_repo = coalesce(e.ingestion_repo, n.ingestion_repo),
+                        e.owner_repo = n.owner_repo,
                         e.file_path = n.file_path,
                         e.entity_type = n.entity_type,
                         e.entity_name = n.entity_name,

@@ -5,8 +5,9 @@ All values are loaded from environment variables and docker-compose.yml
 following the agent.md mandate to avoid hardcoded network configs.
 """
 
-import os
 import logging
+import os
+import json
 from typing import Tuple
 
 from core.startup_config import (
@@ -120,4 +121,61 @@ MONITORED_NAMESPACES: list[str] = [
 Symbols in these namespaces are **always kept**, even when the definition
 is not in the current SCIP index (cross-repo stub).  When the sibling
 repo is later indexed, Neo4j's MERGE will complete the stub node.
+"""
+
+
+def _parse_namespace_owner_repos(raw: str) -> dict[str, str]:
+    """Parse namespace->owner-repo mapping from env.
+
+    Accepted formats:
+    - JSON object: {"webrtc":"repo-b","YAML":"yaml-cpp"}
+    - CSV pairs: webrtc=repo-b,YAML=yaml-cpp
+    """
+    text = raw.strip()
+    if not text:
+        return {}
+
+    # Prefer JSON for explicit structure.
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Invalid MONITORED_NAMESPACE_OWNER_REPOS JSON; falling back to empty mapping"
+            )
+            return {}
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "MONITORED_NAMESPACE_OWNER_REPOS must be a JSON object; falling back to empty mapping"
+            )
+            return {}
+        result: dict[str, str] = {}
+        for key, value in parsed.items():
+            ns = str(key).strip()
+            owner = str(value).strip()
+            if ns and owner:
+                result[ns] = owner
+        return result
+
+    # Backward-friendly lightweight format.
+    result: dict[str, str] = {}
+    for pair in text.split(","):
+        if "=" not in pair:
+            continue
+        ns, owner = pair.split("=", 1)
+        ns = ns.strip()
+        owner = owner.strip()
+        if ns and owner:
+            result[ns] = owner
+    return result
+
+
+MONITORED_NAMESPACE_OWNER_REPOS: dict[str, str] = _parse_namespace_owner_repos(
+    os.getenv("MONITORED_NAMESPACE_OWNER_REPOS", "")
+)
+"""Optional owner-repo overrides for monitored top-level namespaces.
+
+When a monitored symbol is classified as ``stub``, URI generation uses the
+mapped owner repo so cross-repo placeholder nodes MERGE with the owner's
+real node during later ingestion.
 """

@@ -12,6 +12,7 @@ from graphrag.symbol_mapper import (
     scip_symbol_to_entity_name,
     is_external_symbol,
     classify_symbol,
+    resolve_symbol_owner_repo,
     should_drop_symbol,
     SCIP_KIND_CLASS,
     SCIP_KIND_STRUCT,
@@ -472,6 +473,32 @@ class TestCrossRepoStubClassification(unittest.TestCase):
             classify_symbol("cxx . . $ SomeLib/Foo#"),
             "keep",
         )
+
+
+class TestOwnerRepoResolution(unittest.TestCase):
+    """Test namespace->owner-repo resolution for cross-repo stubs."""
+
+    @patch.dict(
+        "graphrag.symbol_mapper.MONITORED_NAMESPACE_OWNER_REPOS",
+        {"webrtc": "repo-b"},
+        clear=True,
+    )
+    def test_resolve_owner_repo_from_namespace_mapping(self):
+        owner = resolve_symbol_owner_repo(
+            "cxx . . $ webrtc/RtpSender#",
+            current_repo_name="repo-a",
+            kind=SCIP_KIND_CLASS,
+        )
+        self.assertEqual(owner, "repo-b")
+
+    @patch.dict("graphrag.symbol_mapper.MONITORED_NAMESPACE_OWNER_REPOS", {}, clear=True)
+    def test_resolve_owner_repo_falls_back_to_current_repo(self):
+        owner = resolve_symbol_owner_repo(
+            "cxx . . $ webrtc/RtpSender#",
+            current_repo_name="repo-a",
+            kind=SCIP_KIND_CLASS,
+        )
+        self.assertEqual(owner, "repo-a")
 
 
 if __name__ == "__main__":

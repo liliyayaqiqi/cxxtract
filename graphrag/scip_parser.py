@@ -39,6 +39,7 @@ class ScipSymbolDef:
     file_path: str              # Document.relative_path
     kind: int                   # SymbolInformation.Kind enum value
     display_name: str           # SymbolInformation.display_name
+    disposition: str = "keep"   # keep|stub after namespace/locality classification
     definition_range: Optional[tuple[int, int, int, int]] = None
     relationships: list[ScipRelationship] = field(default_factory=list)
 
@@ -300,6 +301,7 @@ def parse_scip_index(index_path: str, repo_name: str) -> ScipParseResult:
                     file_path=file_path,
                     kind=sym_info.kind,
                     display_name=sym_info.display_name,
+                    disposition=disposition,
                     definition_range=def_range,
                     relationships=rels,
                 )

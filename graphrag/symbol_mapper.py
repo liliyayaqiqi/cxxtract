@@ -36,7 +36,11 @@ from core.uri_contract import (
     make_function_signature_hash,
     normalize_cpp_entity_name,
 )
-from graphrag.config import IGNORED_NAMESPACES, MONITORED_NAMESPACES
+from graphrag.config import (
+    IGNORED_NAMESPACES,
+    MONITORED_NAMESPACES,
+    MONITORED_NAMESPACE_OWNER_REPOS,
+)
 from graphrag.proto import scip_pb2
 
 logger = logging.getLogger(__name__)
@@ -451,6 +455,22 @@ def scip_symbol_to_global_uri(
             else None
         ),
     )
+
+
+def resolve_symbol_owner_repo(
+    scip_symbol: str,
+    current_repo_name: str,
+    kind: int = 0,
+) -> str:
+    """Resolve owner repo for a symbol, defaulting to current repo.
+
+    For monitored cross-repo stubs this function maps top-level namespace to
+    the configured owner repository, enabling stable cross-repo URI identity.
+    """
+    parsed = parse_scip_symbol(scip_symbol, kind)
+    if parsed is None:
+        return current_repo_name
+    return MONITORED_NAMESPACE_OWNER_REPOS.get(parsed.first_namespace, current_repo_name)
 
 
 def scip_symbol_to_entity_name(scip_symbol: str) -> Optional[str]:

@@ -92,6 +92,10 @@ class TestLocalDefinitionByOccurrence(unittest.TestCase):
             result = parse_scip_index(index_path, repo_name="phase5")
             self.assertTrue(any(s.scip_symbol == local_symbol for s in result.symbols))
             self.assertTrue(any(s.scip_symbol == external_symbol for s in result.symbols))
+            local_node = next(s for s in result.symbols if s.scip_symbol == local_symbol)
+            external_node = next(s for s in result.symbols if s.scip_symbol == external_symbol)
+            self.assertEqual(local_node.disposition, "keep")
+            self.assertEqual(external_node.disposition, "stub")
             self.assertTrue(any(r.scip_symbol == external_symbol for r in result.references))
         finally:
             Path(index_path).unlink(missing_ok=True)

@@ -3,6 +3,7 @@
 import unittest
 from pathlib import Path
 
+from core.uri_contract import parse_global_uri
 from extraction.extractor import extract_file
 from graphrag.proto import scip_pb2
 from graphrag.symbol_mapper import (
@@ -49,6 +50,29 @@ class TestUriContractEquivalencePhase0(unittest.TestCase):
             kind=0,
         )
         self.assertEqual(extraction_uri, scip_uri)
+
+    def test_overloaded_function_uri_equivalence_v2(self) -> None:
+        file_path = self.fixtures_dir / "overloaded_functions.cpp"
+        entities = extract_file(str(file_path), self.repo_name, str(self.fixtures_dir))
+        overloads = [
+            e for e in entities
+            if e.entity_type == "Function" and e.entity_name == "add"
+        ]
+        self.assertEqual(len(overloads), 2)
+        self.assertEqual(len({e.global_uri for e in overloads}), 2)
+
+        for entity in overloads:
+            parsed = parse_global_uri(entity.global_uri)
+            self.assertIn("signature_hash", parsed)
+            sig = parsed["signature_hash"][4:]  # drop "sig_" prefix for SCIP disambiguator
+            scip_uri = scip_symbol_to_global_uri(
+                scip_symbol=f"cxx . . $ add({sig}).",
+                file_path="overloaded_functions.cpp",
+                repo_name=self.repo_name,
+                kind=0,
+                include_function_sig=True,
+            )
+            self.assertEqual(entity.global_uri, scip_uri)
 
     def test_class_uri_equivalence(self) -> None:
         extraction_uri = self._get_uri_from_extraction("simple_class.h", "Calculator")
