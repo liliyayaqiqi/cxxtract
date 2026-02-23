@@ -18,6 +18,7 @@ import os
 from unittest.mock import Mock, patch, call
 from typing import List
 
+import pytest
 from qdrant_client import models
 
 from ingestion.qdrant_loader import (
@@ -51,6 +52,25 @@ class TestIngestionStats(unittest.TestCase):
         self.assertIn("points=10", s)
         self.assertIn("batches=2", s)
         self.assertIn("errors=1", s)
+
+    def test_slo_report(self):
+        """Test SLO-style ingestion report payload."""
+        stats = IngestionStats(
+            points_uploaded=8,
+            points_attempted=10,
+            batches_sent=2,
+            batches_failed=1,
+            retry_attempts=3,
+            errors=2,
+        )
+        stats.add_drop("embedding_failure", 2)
+        report = stats.to_slo_report()
+        self.assertEqual(report["points_attempted"], 10)
+        self.assertEqual(report["points_uploaded"], 8)
+        self.assertEqual(report["points_failed"], 2)
+        self.assertEqual(report["retry_attempts"], 3)
+        self.assertAlmostEqual(report["success_rate"], 0.8, places=6)
+        self.assertEqual(report["dropped_by_reason"]["embedding_failure"], 2)
 
 
 class TestGeneratePointId(unittest.TestCase):
@@ -285,6 +305,8 @@ class TestIngestEntities(unittest.TestCase):
 
         client.delete_collection(collection_name)
 
+    test_ingest_basic = pytest.mark.integration(test_ingest_basic)
+
     def test_ingest_idempotent(self):
         """Test that re-ingesting same data doesn't create duplicates."""
         try:
@@ -316,6 +338,8 @@ class TestIngestEntities(unittest.TestCase):
 
         client.delete_collection(collection_name)
 
+    test_ingest_idempotent = pytest.mark.integration(test_ingest_idempotent)
+
     def test_ingest_batch_size(self):
         """Test batching with small batch size."""
         try:
@@ -338,6 +362,8 @@ class TestIngestEntities(unittest.TestCase):
         self.assertEqual(stats.batches_sent, 3)
 
         client.delete_collection(collection_name)
+
+    test_ingest_batch_size = pytest.mark.integration(test_ingest_batch_size)
 
     def test_ingest_with_error_entity(self):
         """Test that malformed entity is skipped and logged."""
@@ -366,6 +392,8 @@ class TestIngestEntities(unittest.TestCase):
         self.assertEqual(stats.errors, 1)
 
         client.delete_collection(collection_name)
+
+    test_ingest_with_error_entity = pytest.mark.integration(test_ingest_with_error_entity)
 
     def test_ingest_embed_fn_failure_skips_batch(self):
         """Test that if embed_fn raises, the entire batch is skipped."""
@@ -546,6 +574,10 @@ class TestIngestFromJsonl(unittest.TestCase):
         finally:
             os.unlink(temp_path)
 
+    test_ingest_from_jsonl = pytest.mark.integration(test_ingest_from_jsonl)
+    test_jsonl_nonexistent_file = pytest.mark.integration(test_jsonl_nonexistent_file)
+    test_jsonl_malformed = pytest.mark.integration(test_jsonl_malformed)
+
 
 class TestJsonlStreamingIterator(unittest.TestCase):
     """Test streaming JSONL batch iterator utility."""
@@ -592,6 +624,7 @@ class TestQdrantConnection(unittest.TestCase):
 
         except Exception as e:
             self.skipTest(f"Qdrant not available: {e}")
+    test_get_client = pytest.mark.integration(test_get_client)
 
     def test_connection_retry_on_failure(self):
         """Test that connection retries on failure."""
@@ -627,6 +660,7 @@ class TestInitCollection(unittest.TestCase):
         self.assertEqual(info.config.params.vectors.size, 512)
 
         client.delete_collection(collection_name)
+    test_init_collection_create = pytest.mark.integration(test_init_collection_create)
 
     def test_init_collection_recreate(self):
         """Test recreating an existing collection."""
@@ -659,6 +693,7 @@ class TestInitCollection(unittest.TestCase):
         self.assertEqual(count2, 0)
 
         client.delete_collection(collection_name)
+    test_init_collection_recreate = pytest.mark.integration(test_init_collection_recreate)
 
     def test_init_collection_idempotent(self):
         """Test that calling init twice without recreate is safe."""
@@ -681,6 +716,7 @@ class TestInitCollection(unittest.TestCase):
         self.assertTrue(client.collection_exists(collection_name))
 
         client.delete_collection(collection_name)
+    test_init_collection_idempotent = pytest.mark.integration(test_init_collection_idempotent)
 
     def test_init_collection_dimension_mismatch_raises(self):
         """Test that existing collection dimension mismatch raises ValueError."""
@@ -759,6 +795,7 @@ class TestEndToEndIntegration(unittest.TestCase):
                 self.assertEqual(len(point.vector), 256)
 
         client.delete_collection(collection_name)
+    test_complete_pipeline = pytest.mark.integration(test_complete_pipeline)
 
 
 if __name__ == "__main__":

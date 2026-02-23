@@ -19,6 +19,17 @@ import os
 import sys
 import time
 
+from core.structured_logging import (
+    configure_structured_logging,
+    phase_scope,
+    set_run_id,
+)
+from core.startup_config import (
+    resolve_strict_config_validation,
+    validate_startup_config,
+)
+from core.run_artifacts import write_run_report
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +69,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="If set, delete and recreate the Qdrant collection from scratch."
+    )
+    parser.add_argument(
+        "--strict-config",
+        action="store_true",
+        default=resolve_strict_config_validation(default=False),
+        help=(
+            "Enable strict startup config validation. "
+            "Fail fast on docker-compose parse/config errors."
+        ),
     )
 
     return parser.parse_args()
@@ -116,7 +136,11 @@ def phase1_extract(source_dir: str, repo_name: str, output_file: str) -> int:
     return lines_written
 
 
-def phase2_ingest(output_file: str, recreate: bool) -> None:
+def phase2_ingest(
+    output_file: str,
+    recreate: bool,
+    strict_config: bool,
+):
     """Phase 2: Read JSONL from disk and ingest into Qdrant.
 
     Args:
@@ -127,7 +151,11 @@ def phase2_ingest(output_file: str, recreate: bool) -> None:
         FileNotFoundError: If output_file does not exist.
         ConnectionError: If Qdrant is unreachable.
     """
-    from ingestion.qdrant_loader import get_qdrant_client, init_collection, ingest_from_jsonl
+    from ingestion.qdrant_loader import (
+        get_qdrant_client,
+        init_collection,
+        ingest_from_jsonl,
+    )
 
     logger.info("=" * 80)
     logger.info(" PHASE 2: Ingestion from Disk into Qdrant")
@@ -141,7 +169,7 @@ def phase2_ingest(output_file: str, recreate: bool) -> None:
     logger.info("")
 
     # --- Connect ---
-    client = get_qdrant_client()
+    client = get_qdrant_client(strict_config=strict_config)
 
     # --- Initialize collection ---
     init_collection(client, recreate=recreate)
@@ -154,45 +182,95 @@ def phase2_ingest(output_file: str, recreate: bool) -> None:
     logger.info("")
     logger.info(f"Ingestion completed in {ingestion_time:.2f}s")
     logger.info(f"Final stats: {stats}")
+    logger.info("SLO ingestion report: %s", json.dumps(stats.to_slo_report(), sort_keys=True))
     logger.info("")
+    return stats
 
 
 def main() -> None:
     """Main entry point for the pipeline."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    configure_structured_logging(level=logging.INFO)
 
     args = parse_args()
+    run_id = set_run_id()
+    os.environ["STRICT_CONFIG_VALIDATION"] = "true" if args.strict_config else "false"
+    validate_startup_config(
+        compose_path="infra_context/docker-compose.yml",
+        required_services=("qdrant",),
+        strict=args.strict_config,
+    )
 
     logger.info("")
     logger.info("*" * 80)
     logger.info(" C++ Code Extraction & Qdrant Ingestion Pipeline")
+    logger.info(" Run ID: %s", run_id)
     logger.info("*" * 80)
     logger.info("")
 
+    run_report = {
+        "run_id": run_id,
+        "pipeline": "qdrant_ingestion",
+        "repo_name": args.repo_name,
+        "status": "failed",
+        "strict_config": args.strict_config,
+    }
+
     try:
-        lines = phase1_extract(args.source_dir, args.repo_name, args.output_file)
+        with phase_scope("phase1_extract"):
+            lines = phase1_extract(args.source_dir, args.repo_name, args.output_file)
+        run_report["entities_serialized"] = lines
 
         if lines == 0:
             logger.warning("No entities extracted. Skipping ingestion phase.")
+            run_report["status"] = "success_no_entities"
+            report_path = write_run_report(run_report, run_id)
+            logger.info("Run report written: %s", report_path)
             sys.exit(0)
 
-        phase2_ingest(args.output_file, args.recreate_collection)
+        with phase_scope("phase2_ingest"):
+            ingest_stats = phase2_ingest(
+                args.output_file,
+                args.recreate_collection,
+                args.strict_config,
+            )
+        run_report["ingestion"] = ingest_stats.to_slo_report()
+        run_report["status"] = "success"
+
+        logger.info(
+            "Pipeline SLO summary: %s",
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "entities_serialized": lines,
+                    "ingestion": ingest_stats.to_slo_report(),
+                },
+                sort_keys=True,
+            ),
+        )
 
         logger.info("*" * 80)
         logger.info(" Pipeline finished successfully.")
         logger.info("*" * 80)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
 
     except FileNotFoundError as e:
         logger.error(f"File error: {e}")
+        run_report["error"] = str(e)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
         sys.exit(1)
     except ConnectionError as e:
         logger.error(f"Qdrant connection error: {e}")
+        run_report["error"] = str(e)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
+        run_report["error"] = str(e)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
         sys.exit(1)
 
 

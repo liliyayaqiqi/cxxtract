@@ -7,8 +7,8 @@ nodes and edges derived from SCIP index data.
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from core.uri_contract import parse_global_uri
 from neo4j import GraphDatabase, Driver, Session
@@ -61,12 +61,46 @@ class IngestionStats:
     edges_created: int = 0
     batches_sent: int = 0
     errors: int = 0
+    nodes_prepared: int = 0
+    nodes_deduped: int = 0
+    edges_prepared: int = 0
+    edges_deduped: int = 0
+    retry_attempts: int = 0
+    dropped_edges_by_reason: dict[str, int] = field(default_factory=dict)
+
+    def add_dropped_edge_reason(self, reason: str, count: int = 1) -> None:
+        self.dropped_edges_by_reason[reason] = (
+            self.dropped_edges_by_reason.get(reason, 0) + count
+        )
+
+    def edge_write_success_rate(self) -> float:
+        attempted = self.edges_created + self.errors
+        if attempted <= 0:
+            return 1.0
+        return self.edges_created / attempted
+
+    def to_slo_report(self) -> dict[str, Any]:
+        return {
+            "nodes_prepared": self.nodes_prepared,
+            "nodes_deduped": self.nodes_deduped,
+            "nodes_created": self.nodes_created,
+            "edges_prepared": self.edges_prepared,
+            "edges_deduped": self.edges_deduped,
+            "edges_created": self.edges_created,
+            "edge_write_success_rate": round(self.edge_write_success_rate(), 6),
+            "batches_sent": self.batches_sent,
+            "errors": self.errors,
+            "retry_attempts": self.retry_attempts,
+            "dropped_edges_by_reason": dict(
+                sorted(self.dropped_edges_by_reason.items())
+            ),
+        }
     
     def __str__(self) -> str:
         return (
             f"GraphIngestionStats(nodes={self.nodes_created}, "
             f"edges={self.edges_created}, batches={self.batches_sent}, "
-            f"errors={self.errors})"
+            f"errors={self.errors}, edge_success={self.edge_write_success_rate():.2%})"
         )
 
 
@@ -157,12 +191,14 @@ def _dedupe_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
 def _validate_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
     """Drop edges that violate ingestion invariants."""
     valid: list[GraphEdge] = []
+    dropped_counts: dict[str, int] = {}
     for edge in edges:
         try:
             src = parse_global_uri(edge.src_uri)
             tgt = parse_global_uri(edge.tgt_uri)
         except ValueError:
             logger.debug(f"Dropping edge with malformed URI: {edge}")
+            dropped_counts["malformed_uri"] = dropped_counts.get("malformed_uri", 0) + 1
             continue
 
         src_type = src["entity_type"]
@@ -170,6 +206,7 @@ def _validate_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
 
         if edge.relationship_type == "CALLS" and src_type == "File":
             logger.debug(f"Dropping invalid CALLS edge from File node: {edge}")
+            dropped_counts["calls_from_file"] = dropped_counts.get("calls_from_file", 0) + 1
             continue
 
         allowed_pairs = _ALLOWED_EDGE_TYPE_PAIRS.get(edge.relationship_type)
@@ -181,10 +218,17 @@ def _validate_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
                 tgt_type,
                 edge,
             )
+            dropped_counts["impossible_type_pair"] = (
+                dropped_counts.get("impossible_type_pair", 0) + 1
+            )
             continue
 
         valid.append(edge)
+    _validate_edges.last_dropped_counts = dropped_counts  # type: ignore[attr-defined]
     return valid
+
+
+_validate_edges.last_dropped_counts = {}  # type: ignore[attr-defined]
 
 
 def get_neo4j_driver() -> Driver:
@@ -672,6 +716,13 @@ def ingest_graph(
     all_nodes = _dedupe_nodes(all_nodes_raw)
     deduped_edges = _dedupe_edges(all_edges_raw)
     all_edges = _validate_edges(deduped_edges)
+    dropped_edge_counts = getattr(_validate_edges, "last_dropped_counts", {})
+    stats.nodes_prepared = len(all_nodes_raw)
+    stats.nodes_deduped = len(all_nodes)
+    stats.edges_prepared = len(all_edges_raw)
+    stats.edges_deduped = len(deduped_edges)
+    for reason, count in dropped_edge_counts.items():
+        stats.add_dropped_edge_reason(reason, count)
     
     logger.info(
         f"Prepared {len(nodes)} local nodes + {len(stub_nodes)} stub nodes "

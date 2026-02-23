@@ -13,11 +13,15 @@ import logging
 import os
 import time
 import uuid
-import yaml
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Iterable, Iterator, List, Dict, Any, Optional, Callable
 
 from qdrant_client import QdrantClient, models
+from core.startup_config import (
+    load_docker_compose_config,
+    resolve_service_port,
+    resolve_strict_config_validation,
+)
 
 from ingestion.config import (
     DOCKER_COMPOSE_PATH,
@@ -44,14 +48,43 @@ class IngestionStats:
     """Statistics for an ingestion operation."""
 
     points_uploaded: int = 0
+    points_attempted: int = 0
     batches_sent: int = 0
+    batches_failed: int = 0
     errors: int = 0
+    retry_attempts: int = 0
+    dropped_by_reason: Dict[str, int] = field(default_factory=dict)
+
+    def add_drop(self, reason: str, count: int = 1) -> None:
+        """Increment dropped/skipped counters by reason."""
+        self.dropped_by_reason[reason] = self.dropped_by_reason.get(reason, 0) + count
+
+    def success_rate(self) -> float:
+        """Return successful write rate over attempted points."""
+        if self.points_attempted <= 0:
+            return 1.0
+        return self.points_uploaded / self.points_attempted
+
+    def to_slo_report(self) -> Dict[str, Any]:
+        """Return SLO-style ingestion report payload."""
+        return {
+            "points_attempted": self.points_attempted,
+            "points_uploaded": self.points_uploaded,
+            "points_failed": self.points_attempted - self.points_uploaded,
+            "success_rate": round(self.success_rate(), 6),
+            "batches_sent": self.batches_sent,
+            "batches_failed": self.batches_failed,
+            "retry_attempts": self.retry_attempts,
+            "errors": self.errors,
+            "dropped_by_reason": dict(sorted(self.dropped_by_reason.items())),
+        }
 
     def __str__(self) -> str:
         """String representation of stats."""
         return (
             f"IngestionStats(points={self.points_uploaded}, "
-            f"batches={self.batches_sent}, errors={self.errors})"
+            f"batches={self.batches_sent}, errors={self.errors}, "
+            f"success_rate={self.success_rate():.2%})"
         )
 
 
@@ -83,12 +116,12 @@ def _upsert_with_retries(
     points: List[models.PointStruct],
     max_retries: int = UPSERT_RETRIES,
     retry_base_delay: float = UPSERT_RETRY_BASE_DELAY,
-) -> bool:
+) -> tuple[bool, int]:
     """Upsert a batch with bounded exponential backoff retries."""
     for attempt in range(1, max_retries + 1):
         try:
             client.upsert(collection_name=collection_name, points=points)
-            return True
+            return True, attempt - 1
         except Exception as e:
             if attempt == max_retries:
                 logger.error(
@@ -97,7 +130,7 @@ def _upsert_with_retries(
                     len(points),
                     e,
                 )
-                return False
+                return False, attempt - 1
 
             sleep_seconds = retry_base_delay * (2 ** (attempt - 1))
             logger.warning(
@@ -110,10 +143,10 @@ def _upsert_with_retries(
             )
             time.sleep(sleep_seconds)
 
-    return False
+    return False, max_retries - 1
 
 
-def get_qdrant_client() -> QdrantClient:
+def get_qdrant_client(strict_config: Optional[bool] = None) -> QdrantClient:
     """Connect to Qdrant instance using configuration from docker-compose.yml.
 
     Parses the docker-compose configuration to extract the Qdrant port,
@@ -130,32 +163,21 @@ def get_qdrant_client() -> QdrantClient:
         >>> client = get_qdrant_client()
         >>> collections = client.get_collections()
     """
-    # Parse docker-compose.yml for Qdrant port
-    port = QDRANT_DEFAULT_PORT
+    if strict_config is None:
+        strict_config = resolve_strict_config_validation(default=False)
 
-    try:
-        with open(DOCKER_COMPOSE_PATH, "r") as f:
-            config = yaml.safe_load(f)
-
-        qdrant_config = config.get("services", {}).get("qdrant", {})
-        ports = qdrant_config.get("ports", [])
-
-        # Find the port mapping for 6333 (Qdrant HTTP API)
-        for port_mapping in ports:
-            port_str = str(port_mapping)
-            if ":6333" in port_str:
-                # Extract host port from "6333:6333" format
-                port = int(port_str.split(":")[0])
-                break
-
-        logger.debug(f"Extracted Qdrant port from docker-compose: {port}")
-
-    except FileNotFoundError:
-        logger.warning(
-            f"Could not find {DOCKER_COMPOSE_PATH}, using default port {QDRANT_DEFAULT_PORT}"
-        )
-    except Exception as e:
-        logger.warning(f"Error parsing docker-compose.yml: {e}, using default port")
+    compose = load_docker_compose_config(
+        DOCKER_COMPOSE_PATH,
+        strict=strict_config,
+    )
+    port = resolve_service_port(
+        compose_data=compose,
+        service_name="qdrant",
+        container_port=6333,
+        default_port=QDRANT_DEFAULT_PORT,
+        strict=strict_config,
+    )
+    logger.debug("Extracted Qdrant port from docker-compose: %d", port)
 
     # Attempt connection with retries
     for attempt in range(CONNECTION_RETRIES):
@@ -429,6 +451,7 @@ def _iter_embedding_batches(
                 entity.get("global_uri", "unknown"),
             )
             stats.errors += 1
+            stats.add_drop("missing_required_field", 1)
             continue
 
         text_len = len(text)
@@ -516,6 +539,7 @@ def ingest_entities(
                 "Batch embedding failed for %d texts: %s", len(embed_texts), e
             )
             stats.errors += len(valid_entities)
+            stats.add_drop("embedding_failure", len(valid_entities))
             continue
 
         # Sanity check: API must return exactly one vector per text
@@ -526,6 +550,7 @@ def ingest_entities(
                 len(vectors),
             )
             stats.errors += len(valid_entities)
+            stats.add_drop("embedding_count_mismatch", len(valid_entities))
             continue
 
         # ------------------------------------------------------------------
@@ -543,6 +568,7 @@ def ingest_entities(
                     len(vector),
                 )
                 stats.errors += 1
+                stats.add_drop("vector_dimension_mismatch", 1)
                 continue
 
             try:
@@ -555,18 +581,22 @@ def ingest_entities(
                     e,
                 )
                 stats.errors += 1
+                stats.add_drop("point_build_failure", 1)
 
         # ------------------------------------------------------------------
         # Step 4: Upsert batch to Qdrant
         # ------------------------------------------------------------------
         if batch_points:
-            if _upsert_with_retries(
+            stats.points_attempted += len(batch_points)
+            upsert_ok, retries_used = _upsert_with_retries(
                 client=client,
                 collection_name=collection_name,
                 points=batch_points,
                 max_retries=upsert_retries,
                 retry_base_delay=upsert_retry_base_delay,
-            ):
+            )
+            stats.retry_attempts += retries_used
+            if upsert_ok:
                 stats.points_uploaded += len(batch_points)
                 stats.batches_sent += 1
 
@@ -589,8 +619,11 @@ def ingest_entities(
                     uri_preview,
                 )
                 stats.errors += len(batch_points)
+                stats.batches_failed += 1
+                stats.add_drop("upsert_failed", len(batch_points))
 
     logger.info("Ingestion complete: %s", stats)
+    logger.info("Ingestion SLO report: %s", json.dumps(stats.to_slo_report(), sort_keys=True))
     return stats
 
 
@@ -658,6 +691,10 @@ def ingest_from_jsonl(
         aggregate.errors += batch_stats.errors
 
     logger.info("JSONL ingestion complete: %s", aggregate)
+    logger.info(
+        "JSONL ingestion SLO report: %s",
+        json.dumps(aggregate.to_slo_report(), sort_keys=True),
+    )
     return aggregate
 
 

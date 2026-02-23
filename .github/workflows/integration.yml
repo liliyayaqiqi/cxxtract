@@ -1,0 +1,55 @@
+name: Integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_external:
+        description: "Also run external dataset integration tests"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  integration:
+    name: Service-backed Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports:
+          - 6333:6333
+      neo4j:
+        image: neo4j:latest
+        env:
+          NEO4J_AUTH: neo4j/testpassword123
+        ports:
+          - 7687:7687
+          - 7474:7474
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run Reproducible Integration Suite
+        run: pytest -q -m "integration and not external"
+
+      - name: Run External Dataset Integration Suite
+        if: ${{ inputs.include_external }}
+        env:
+          GRAPHRAG_TEST_SCIP_INDEX: ${{ secrets.GRAPHRAG_TEST_SCIP_INDEX }}
+          GRAPHRAG_TEST_REPO_NAME: ci-external-repo
+        run: pytest -q -m external

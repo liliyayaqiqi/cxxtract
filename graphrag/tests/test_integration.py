@@ -7,6 +7,9 @@ Requires yaml-cpp SCIP index and Neo4j running.
 
 import unittest
 import os
+from pathlib import Path
+
+import pytest
 
 from graphrag.scip_parser import parse_scip_index
 from graphrag.neo4j_loader import (
@@ -21,6 +24,22 @@ from graphrag.query import (
     get_inheritance_tree,
 )
 
+pytestmark = [pytest.mark.integration, pytest.mark.external]
+
+
+def _discover_scip_index_path() -> str | None:
+    """Discover SCIP index path from env/workspace candidates."""
+    env_path = os.getenv("GRAPHRAG_TEST_SCIP_INDEX")
+    candidates = []
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path(__file__).resolve().parents[2] / "output" / "index.scip")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
 
 class TestEndToEndPipeline(unittest.TestCase):
     """Test complete pipeline from SCIP to Neo4j."""
@@ -28,10 +47,12 @@ class TestEndToEndPipeline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up test database once for all tests."""
-        # Check if yaml-cpp index exists
-        cls.index_path = "/Users/yaqi.li/testproject/yaml-cpp-master/index.scip"
-        if not os.path.isfile(cls.index_path):
-            raise unittest.SkipTest("yaml-cpp index.scip not available")
+        cls.index_path = _discover_scip_index_path()
+        if cls.index_path is None:
+            raise unittest.SkipTest(
+                "SCIP index not available. Set GRAPHRAG_TEST_SCIP_INDEX or "
+                "provide output/index.scip."
+            )
         
         try:
             cls.driver = get_neo4j_driver()
@@ -40,7 +61,7 @@ class TestEndToEndPipeline(unittest.TestCase):
             raise unittest.SkipTest("Neo4j not available")
         
         # Clear and ingest test data
-        cls.repo_name = "yaml-cpp-test"
+        cls.repo_name = os.getenv("GRAPHRAG_TEST_REPO_NAME", "graphrag-integration-test")
         clear_repo_graph(cls.driver, cls.repo_name)
         
         print("\nParsing SCIP index...")

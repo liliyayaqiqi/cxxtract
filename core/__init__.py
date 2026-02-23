@@ -6,11 +6,36 @@ from core.uri_contract import (
     normalize_cpp_entity_name,
     parse_global_uri,
 )
+from core.structured_logging import (
+    configure_structured_logging,
+    get_run_id,
+    phase_scope,
+    set_run_id,
+)
+from core.startup_config import (
+    ConfigValidationError,
+    load_docker_compose_config,
+    resolve_neo4j_auth,
+    resolve_service_port,
+    resolve_strict_config_validation,
+    validate_startup_config,
+)
+from core.run_artifacts import write_run_report
 
 __all__ = [
     "GLOBAL_URI_SEPARATOR",
     "create_global_uri",
     "normalize_cpp_entity_name",
     "parse_global_uri",
+    "configure_structured_logging",
+    "get_run_id",
+    "phase_scope",
+    "set_run_id",
+    "ConfigValidationError",
+    "load_docker_compose_config",
+    "resolve_neo4j_auth",
+    "resolve_service_port",
+    "resolve_strict_config_validation",
+    "validate_startup_config",
+    "write_run_report",
 ]
-

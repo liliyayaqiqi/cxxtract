@@ -14,10 +14,22 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
+
+from core.structured_logging import (
+    configure_structured_logging,
+    phase_scope,
+    set_run_id,
+)
+from core.startup_config import (
+    resolve_strict_config_validation,
+    validate_startup_config,
+)
+from core.run_artifacts import write_run_report
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +83,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Number of parallel scip-clang processes (default: CPU count)",
     )
+    parser.add_argument(
+        "--strict-config",
+        action="store_true",
+        default=resolve_strict_config_validation(default=False),
+        help=(
+            "Enable strict startup config validation. "
+            "Fail fast on docker-compose parse/config errors."
+        ),
+    )
     
     return parser.parse_args()
 
@@ -105,7 +126,7 @@ def phase1_index(compdb_path: str, index_path: str, jobs: int | None) -> str:
     return index_output
 
 
-def phase2_ingest(index_path: str, repo_name: str, recreate: bool) -> None:
+def phase2_ingest(index_path: str, repo_name: str, recreate: bool):
     """Phase 2: Parse SCIP index and ingest into Neo4j.
     
     Args:
@@ -158,9 +179,22 @@ def phase2_ingest(index_path: str, repo_name: str, recreate: bool) -> None:
     
     logger.info(f"Graph ingestion completed in {ingest_time:.2f}s")
     logger.info(f"Final stats: {stats}")
+    logger.info("Graph ingestion SLO report: %s", json.dumps(stats.to_slo_report(), sort_keys=True))
+    logger.info(
+        "SCIP parse drop report: %s",
+        json.dumps(
+            {
+                "dropped_symbol_count": parse_result.dropped_symbol_count,
+                "dropped_reference_count": parse_result.dropped_reference_count,
+                "external_symbol_count": parse_result.external_symbol_count,
+            },
+            sort_keys=True,
+        ),
+    )
     logger.info("")
     
     driver.close()
+    return parse_result, stats
 
 
 def phase3_verify(repo_name: str) -> None:
@@ -227,47 +261,106 @@ def phase3_verify(repo_name: str) -> None:
 def main() -> None:
     """Main entry point for the GraphRAG pipeline."""
     
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    configure_structured_logging(level=logging.INFO)
     
     args = parse_args()
+    run_id = set_run_id()
+    os.environ["STRICT_CONFIG_VALIDATION"] = "true" if args.strict_config else "false"
+    validate_startup_config(
+        compose_path="infra_context/docker-compose.yml",
+        required_services=("neo4j",),
+        strict=args.strict_config,
+    )
     
     logger.info("")
     logger.info("*" * 80)
     logger.info(" C++ GraphRAG Pipeline: SCIP -> Neo4j Dependency Graph")
+    logger.info(" Run ID: %s", run_id)
     logger.info("*" * 80)
     logger.info("")
+
+    run_report = {
+        "run_id": run_id,
+        "pipeline": "graphrag",
+        "repo_name": args.repo_name,
+        "status": "failed",
+        "strict_config": args.strict_config,
+        "skip_indexing": args.skip_indexing,
+    }
     
     try:
         # Phase 1: SCIP Indexing
         if not args.skip_indexing:
-            index_path = phase1_index(args.compdb_path, args.index_path, args.jobs)
+            with phase_scope("phase1_index"):
+                index_path = phase1_index(args.compdb_path, args.index_path, args.jobs)
+            run_report["index_path"] = index_path
         else:
             index_path = args.index_path
             logger.info("Skipping SCIP indexing (--skip-indexing)")
             logger.info(f"Using existing index: {index_path}")
             logger.info("")
+            run_report["index_path"] = index_path
         
         # Phase 2: Parse + Ingest
-        phase2_ingest(index_path, args.repo_name, args.recreate_graph)
+        with phase_scope("phase2_ingest"):
+            parse_result, graph_stats = phase2_ingest(
+                index_path, args.repo_name, args.recreate_graph
+            )
+        run_report["scip_parse"] = {
+            "document_count": parse_result.document_count,
+            "symbol_count": len(parse_result.symbols),
+            "reference_count": len(parse_result.references),
+            "dropped_symbol_count": parse_result.dropped_symbol_count,
+            "dropped_reference_count": parse_result.dropped_reference_count,
+        }
+        run_report["graph_ingestion"] = graph_stats.to_slo_report()
         
         # Phase 3: Verification
-        phase3_verify(args.repo_name)
+        with phase_scope("phase3_verify"):
+            phase3_verify(args.repo_name)
+
+        logger.info(
+            "Pipeline SLO summary: %s",
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "scip_parse": {
+                        "document_count": parse_result.document_count,
+                        "symbol_count": len(parse_result.symbols),
+                        "reference_count": len(parse_result.references),
+                        "dropped_symbol_count": parse_result.dropped_symbol_count,
+                        "dropped_reference_count": parse_result.dropped_reference_count,
+                    },
+                    "graph_ingestion": graph_stats.to_slo_report(),
+                },
+                sort_keys=True,
+            ),
+        )
+        run_report["status"] = "success"
         
         logger.info("*" * 80)
         logger.info(" GraphRAG pipeline finished successfully")
         logger.info("*" * 80)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
         
     except FileNotFoundError as e:
         logger.error(f"File error: {e}")
+        run_report["error"] = str(e)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
         sys.exit(1)
     except ConnectionError as e:
         logger.error(f"Neo4j connection error: {e}")
+        run_report["error"] = str(e)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
+        run_report["error"] = str(e)
+        report_path = write_run_report(run_report, run_id)
+        logger.info("Run report written: %s", report_path)
         sys.exit(1)
 
 

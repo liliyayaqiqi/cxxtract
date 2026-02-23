@@ -6,9 +6,15 @@ following the agent.md mandate to avoid hardcoded network configs.
 """
 
 import os
-import yaml
 import logging
 from typing import Tuple
+
+from core.startup_config import (
+    load_docker_compose_config,
+    resolve_neo4j_auth,
+    resolve_service_port,
+    resolve_strict_config_validation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +33,8 @@ DEFAULT_INDEX_OUTPUT: str = "output/index.scip"
 # Neo4j configuration (parsed from docker-compose.yml)
 # ---------------------------------------------------------------------------
 
+STRICT_CONFIG_VALIDATION: bool = resolve_strict_config_validation(default=False)
+
 
 def _parse_neo4j_config() -> Tuple[str, str, str]:
     """Parse Neo4j connection config from docker-compose.yml.
@@ -38,42 +46,27 @@ def _parse_neo4j_config() -> Tuple[str, str, str]:
         FileNotFoundError: If docker-compose.yml not found.
         KeyError: If neo4j service not configured.
     """
-    try:
-        with open(DOCKER_COMPOSE_PATH, "r") as f:
-            config = yaml.safe_load(f)
-        
-        neo4j_config = config.get("services", {}).get("neo4j", {})
-        
-        # Parse Bolt port (7687)
-        port = 7687
-        for port_mapping in neo4j_config.get("ports", []):
-            port_str = str(port_mapping)
-            if ":7687" in port_str:
-                port = int(port_str.split(":")[0])
-                break
-        
-        uri = f"bolt://127.0.0.1:{port}"
-        
-        # Parse NEO4J_AUTH environment variable
-        username = "neo4j"
-        password = "testpassword123"
-        
-        env_vars = neo4j_config.get("environment", [])
-        for env in env_vars:
-            if isinstance(env, str) and env.startswith("NEO4J_AUTH="):
-                auth_val = env.split("=", 1)[1]
-                if "/" in auth_val:
-                    username, password = auth_val.split("/", 1)
-        
-        logger.debug(f"Parsed Neo4j config: uri={uri}, username={username}")
-        return uri, username, password
-        
-    except FileNotFoundError:
-        logger.warning(f"Could not find {DOCKER_COMPOSE_PATH}, using defaults")
-        return "bolt://127.0.0.1:7687", "neo4j", "testpassword123"
-    except Exception as e:
-        logger.warning(f"Error parsing Neo4j config: {e}, using defaults")
-        return "bolt://127.0.0.1:7687", "neo4j", "testpassword123"
+    compose = load_docker_compose_config(
+        DOCKER_COMPOSE_PATH,
+        strict=STRICT_CONFIG_VALIDATION,
+    )
+    port = resolve_service_port(
+        compose_data=compose,
+        service_name="neo4j",
+        container_port=7687,
+        default_port=7687,
+        strict=STRICT_CONFIG_VALIDATION,
+    )
+    username, password = resolve_neo4j_auth(
+        compose_data=compose,
+        default_username="neo4j",
+        default_password="testpassword123",
+        strict=STRICT_CONFIG_VALIDATION,
+    )
+
+    uri = f"bolt://127.0.0.1:{port}"
+    logger.debug("Parsed Neo4j config: uri=%s, username=%s", uri, username)
+    return uri, username, password
 
 
 NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD = _parse_neo4j_config()
