@@ -7,15 +7,27 @@ single files or entire directory trees.
 
 import logging
 import os
-from pathlib import Path
+from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
-from extraction.config import CPP_EXTENSIONS
+from extraction.config import (
+    CPP_EXTENSIONS,
+    DEFAULT_INCLUDE_DECLARATIONS,
+    DEFAULT_EXTERN_C_DECLARATIONS,
+)
 from extraction.models import ExtractedEntity
-from extraction.parser import parse_file
+from extraction.parser import parse_file, count_error_nodes
 from extraction.traversal import extract_entities_from_tree
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FileExtractionDiagnostics:
+    """Per-file extraction diagnostics."""
+
+    entities: List[ExtractedEntity]
+    parse_error_count: int
 
 
 class ExtractionStats:
@@ -45,10 +57,75 @@ class ExtractionStats:
         )
 
 
+def _extract_file_with_diagnostics(
+    file_path: str,
+    repo_name: str,
+    repo_root: Optional[str],
+    include_declarations: bool,
+    extern_c_declarations: bool,
+) -> FileExtractionDiagnostics:
+    """Extract entities from a single file with parse diagnostics."""
+    file_path = os.path.abspath(file_path)
+
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    ext = os.path.splitext(file_path)[1]
+    if ext not in CPP_EXTENSIONS:
+        raise ValueError(
+            f"File {file_path} is not a C++ source file. "
+            f"Expected one of: {CPP_EXTENSIONS}"
+        )
+
+    if repo_root is None:
+        resolved_repo_root = os.path.dirname(file_path)
+    else:
+        resolved_repo_root = os.path.abspath(repo_root)
+
+    try:
+        relative_path = os.path.relpath(file_path, resolved_repo_root)
+    except ValueError:
+        logger.warning(
+            "Cannot compute relative path for %s from %s. Using absolute path.",
+            file_path,
+            resolved_repo_root,
+        )
+        relative_path = file_path
+
+    logger.info("Extracting entities from %s", relative_path)
+
+    tree, source_bytes = parse_file(file_path)
+    parse_error_count = count_error_nodes(tree)
+
+    if tree.root_node.has_error:
+        logger.warning(
+            "File %s contains syntax errors (%d error nodes)",
+            relative_path,
+            parse_error_count,
+        )
+
+    entities = extract_entities_from_tree(
+        tree=tree,
+        source_bytes=source_bytes,
+        repo_name=repo_name,
+        file_path=relative_path,
+        include_declarations=include_declarations,
+        extern_c_declarations=extern_c_declarations,
+    )
+    logger.info("Extracted %d entities from %s", len(entities), relative_path)
+
+    return FileExtractionDiagnostics(
+        entities=entities,
+        parse_error_count=parse_error_count,
+    )
+
+
 def extract_file(
     file_path: str,
     repo_name: str,
-    repo_root: Optional[str] = None
+    repo_root: Optional[str] = None,
+    include_declarations: bool = DEFAULT_INCLUDE_DECLARATIONS,
+    extern_c_declarations: bool = DEFAULT_EXTERN_C_DECLARATIONS,
 ) -> List[ExtractedEntity]:
     """Extract all entities from a single C++ source file.
     
@@ -56,6 +133,9 @@ def extract_file(
         file_path: Absolute or relative path to the C++ file.
         repo_name: Repository name for URI generation.
         repo_root: Repository root directory. If None, uses file's parent directory.
+        include_declarations: Whether to extract declaration-only functions.
+        extern_c_declarations: Whether to include declaration-only functions
+            in extern "C" contexts.
         
     Returns:
         List of extracted entities from the file.
@@ -69,57 +149,18 @@ def extract_file(
         >>> for entity in entities:
         ...     print(entity.global_uri)
     """
-    file_path = os.path.abspath(file_path)
-    
-    # Verify file exists
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-    
-    # Verify it's a C++ file
-    ext = os.path.splitext(file_path)[1]
-    if ext not in CPP_EXTENSIONS:
-        raise ValueError(
-            f"File {file_path} is not a C++ source file. "
-            f"Expected one of: {CPP_EXTENSIONS}"
-        )
-    
-    # Determine repo root
-    if repo_root is None:
-        repo_root = os.path.dirname(file_path)
-    else:
-        repo_root = os.path.abspath(repo_root)
-    
-    # Compute relative path
     try:
-        relative_path = os.path.relpath(file_path, repo_root)
-    except ValueError:
-        # On Windows, relpath fails if paths are on different drives
-        logger.warning(
-            f"Cannot compute relative path for {file_path} from {repo_root}. "
-            f"Using absolute path."
+        diagnostics = _extract_file_with_diagnostics(
+            file_path=file_path,
+            repo_name=repo_name,
+            repo_root=repo_root,
+            include_declarations=include_declarations,
+            extern_c_declarations=extern_c_declarations,
         )
-        relative_path = file_path
-    
-    logger.info(f"Extracting entities from {relative_path}")
-    
-    try:
-        # Parse the file
-        tree, source_bytes = parse_file(file_path)
-        
-        # Check for parse errors
-        if tree.root_node.has_error:
-            logger.warning(f"File {relative_path} contains syntax errors")
-        
-        # Extract entities
-        entities = extract_entities_from_tree(
-            tree, source_bytes, repo_name, relative_path
-        )
-        
-        logger.info(f"Extracted {len(entities)} entities from {relative_path}")
-        return entities
+        return diagnostics.entities
         
     except Exception as e:
-        logger.error(f"Error extracting entities from {relative_path}: {e}")
+        logger.error("Error extracting entities from %s: %s", file_path, e)
         raise
 
 
@@ -162,7 +203,9 @@ def extract_directory(
     directory: str,
     repo_name: str,
     repo_root: Optional[str] = None,
-    continue_on_error: bool = True
+    continue_on_error: bool = True,
+    include_declarations: bool = DEFAULT_INCLUDE_DECLARATIONS,
+    extern_c_declarations: bool = DEFAULT_EXTERN_C_DECLARATIONS,
 ) -> tuple[List[ExtractedEntity], ExtractionStats]:
     """Extract entities from all C++ files in a directory tree.
     
@@ -173,6 +216,9 @@ def extract_directory(
                    If None, uses the directory parameter.
         continue_on_error: If True, continue processing files even if some fail.
                           If False, raise exception on first error.
+        include_declarations: Whether to extract declaration-only functions.
+        extern_c_declarations: Whether to include declaration-only functions
+            inside extern "C" blocks.
         
     Returns:
         A tuple of (entities, stats) where:
@@ -211,10 +257,17 @@ def extract_directory(
     
     for file_path in cpp_files:
         try:
-            entities = extract_file(file_path, repo_name, repo_root)
-            all_entities.extend(entities)
+            diagnostics = _extract_file_with_diagnostics(
+                file_path=file_path,
+                repo_name=repo_name,
+                repo_root=repo_root,
+                include_declarations=include_declarations,
+                extern_c_declarations=extern_c_declarations,
+            )
+            all_entities.extend(diagnostics.entities)
             stats.files_processed += 1
-            stats.entities_extracted += len(entities)
+            stats.entities_extracted += len(diagnostics.entities)
+            stats.parse_errors += diagnostics.parse_error_count
             
         except FileNotFoundError as e:
             logger.error(f"File not found: {e}")
@@ -241,7 +294,9 @@ def extract_directory(
 def extract_to_dict_list(
     source: str,
     repo_name: str,
-    repo_root: Optional[str] = None
+    repo_root: Optional[str] = None,
+    include_declarations: bool = DEFAULT_INCLUDE_DECLARATIONS,
+    extern_c_declarations: bool = DEFAULT_EXTERN_C_DECLARATIONS,
 ) -> List[Dict[str, Any]]:
     """Extract entities and return as a list of dictionaries.
     
@@ -253,6 +308,9 @@ def extract_to_dict_list(
         source: Path to a file or directory.
         repo_name: Repository name for URI generation.
         repo_root: Repository root directory.
+        include_declarations: Whether to extract declaration-only functions.
+        extern_c_declarations: Whether to include declaration-only functions
+            inside extern "C" blocks.
         
     Returns:
         List of entity dictionaries.
@@ -265,9 +323,21 @@ def extract_to_dict_list(
     source = os.path.abspath(source)
     
     if os.path.isfile(source):
-        entities = extract_file(source, repo_name, repo_root)
+        entities = extract_file(
+            source,
+            repo_name,
+            repo_root,
+            include_declarations=include_declarations,
+            extern_c_declarations=extern_c_declarations,
+        )
     elif os.path.isdir(source):
-        entities, stats = extract_directory(source, repo_name, repo_root)
+        entities, stats = extract_directory(
+            source,
+            repo_name,
+            repo_root,
+            include_declarations=include_declarations,
+            extern_c_declarations=extern_c_declarations,
+        )
         logger.info(f"Extraction stats: {stats}")
     else:
         raise FileNotFoundError(f"Source not found: {source}")

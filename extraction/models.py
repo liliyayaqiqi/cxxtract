@@ -5,6 +5,8 @@ Data models for extracted C++ entities.
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
 
+from core.uri_contract import create_global_uri
+
 
 @dataclass
 class ExtractedEntity:
@@ -61,4 +63,9 @@ class ExtractedEntity:
         Returns:
             Global URI string in format RepoName::FilePath::EntityType::EntityName
         """
-        return f"{repo_name}::{file_path}::{entity_type}::{entity_name}"
+        return create_global_uri(
+            repo_name=repo_name,
+            file_path=file_path,
+            entity_type=entity_type,
+            entity_name=entity_name,
+        )

@@ -98,3 +98,24 @@ def parse_file(file_path: str) -> Tuple[Tree, bytes]:
     
     logger.info(f"Successfully parsed file: {file_path}")
     return tree, source_bytes
+
+
+def count_error_nodes(tree: Tree) -> int:
+    """Count ERROR nodes in a parsed tree.
+
+    Args:
+        tree: Parsed syntax tree.
+
+    Returns:
+        Number of nodes whose type is ``ERROR``.
+    """
+    count = 0
+    stack = [tree.root_node]
+
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR":
+            count += 1
+        stack.extend(node.children)
+
+    return count

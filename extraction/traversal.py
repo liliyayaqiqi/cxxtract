@@ -9,6 +9,7 @@ import logging
 from typing import List, Optional, Tuple
 from tree_sitter import Node, Tree
 
+from core.uri_contract import normalize_cpp_entity_name
 from extraction.config import (
     TARGET_ENTITY_TYPES,
     TEMPLATE_WRAPPER,
@@ -20,6 +21,8 @@ from extraction.config import (
     DOXYGEN_PREFIXES,
     ENTITY_TYPE_MAP,
     PREPROCESSOR_CONTAINERS,
+    DEFAULT_INCLUDE_DECLARATIONS,
+    DEFAULT_EXTERN_C_DECLARATIONS,
 )
 from extraction.models import ExtractedEntity
 
@@ -59,24 +62,33 @@ def clean_doxygen_comment(comment_text: str) -> str:
     lines = comment_text.split('\n')
     cleaned_lines = []
     
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
-        
-        # Remove /// or //! prefix
-        if stripped.startswith('///'):
-            stripped = stripped[3:].lstrip()
-        elif stripped.startswith('//!'):
-            stripped = stripped[3:].lstrip()
-        # Remove /** or /*! prefix
-        elif stripped.startswith('/**'):
-            stripped = stripped[3:].lstrip()
-        elif stripped.startswith('/*!'):
-            stripped = stripped[3:].lstrip()
-        # Remove */ suffix
-        elif stripped.endswith('*/'):
+
+        # Strip starting markers on the first line.
+        if idx == 0:
+            if stripped.startswith('///'):
+                stripped = stripped[3:]
+            elif stripped.startswith('//!'):
+                stripped = stripped[3:]
+            elif stripped.startswith('/**'):
+                stripped = stripped[3:]
+            elif stripped.startswith('/*!'):
+                stripped = stripped[3:]
+        else:
+            if stripped.startswith('///'):
+                stripped = stripped[3:]
+            elif stripped.startswith('//!'):
+                stripped = stripped[3:]
+
+        stripped = stripped.strip()
+
+        # Strip trailing block marker regardless of line position.
+        if stripped.endswith('*/'):
             stripped = stripped[:-2].rstrip()
-        # Remove leading * from continuation lines
-        elif stripped.startswith('*') and not stripped.startswith('**'):
+
+        # Strip continuation '*' in multiline block comments.
+        if stripped.startswith('*'):
             stripped = stripped[1:].lstrip()
         
         if stripped:  # Only add non-empty lines
@@ -210,12 +222,13 @@ def extract_function_name(node: Node, source_bytes: bytes) -> Optional[str]:
     if declarator.type == "function_declarator":
         name_node = declarator.child_by_field_name("declarator")
         if name_node and name_node.text:
-            return name_node.text.decode("utf-8")
+            return normalize_cpp_entity_name(name_node.text.decode("utf-8"))
     
     # Fallback: try to get text directly from declarator
     if declarator.text:
         # For simple cases, the declarator itself might be the identifier
-        return declarator.text.decode("utf-8").split('(')[0].strip()
+        raw_name = declarator.text.decode("utf-8").split('(')[0].strip()
+        return normalize_cpp_entity_name(raw_name)
     
     return None
 
@@ -232,7 +245,7 @@ def extract_class_name(node: Node, source_bytes: bytes) -> Optional[str]:
     """
     name_node = node.child_by_field_name("name")
     if name_node and name_node.text:
-        return name_node.text.decode("utf-8")
+        return normalize_cpp_entity_name(name_node.text.decode("utf-8"))
     
     logger.debug(f"Class at line {node.start_point.row + 1} has no name (anonymous)")
     return None
@@ -250,8 +263,102 @@ def extract_namespace_name(node: Node, source_bytes: bytes) -> Optional[str]:
     """
     name_node = node.child_by_field_name("name")
     if name_node and name_node.text:
-        return name_node.text.decode("utf-8")
+        return normalize_cpp_entity_name(name_node.text.decode("utf-8"))
     return None
+
+
+def extract_function_declaration_name(node: Node) -> Optional[str]:
+    """Extract function name from a declaration node containing function_declarator.
+
+    Args:
+        node: A declaration node.
+
+    Returns:
+        Function name if declaration is a function prototype, else None.
+    """
+    if node.type != DECLARATION_NODE:
+        return None
+
+    declarator = node.child_by_field_name("declarator")
+    if declarator is None:
+        return None
+
+    if declarator.type == "function_declarator":
+        name_node = declarator.child_by_field_name("declarator")
+        if name_node and name_node.text:
+            return normalize_cpp_entity_name(name_node.text.decode("utf-8"))
+        return None
+
+    # Some forms are wrapped one level deeper.
+    inner = declarator.child_by_field_name("declarator")
+    if inner and inner.type == "function_declarator":
+        inner_name = inner.child_by_field_name("declarator")
+        if inner_name and inner_name.text:
+            return normalize_cpp_entity_name(inner_name.text.decode("utf-8"))
+
+    return None
+
+
+def _should_extract_declaration(
+    include_declarations: bool,
+    extern_context: bool,
+    extern_c_declarations: bool,
+) -> bool:
+    """Determine if declaration-only functions should be emitted."""
+    return include_declarations or (extern_context and extern_c_declarations)
+
+
+def extract_declaration_entity(
+    node: Node,
+    source_bytes: bytes,
+    repo_name: str,
+    file_path: str,
+    namespace_stack: List[str],
+) -> Optional[ExtractedEntity]:
+    """Extract a function declaration as an entity.
+
+    Args:
+        node: Declaration node containing a function prototype.
+        source_bytes: Raw source bytes.
+        repo_name: Repository name.
+        file_path: Relative file path.
+        namespace_stack: Active namespace stack.
+
+    Returns:
+        ExtractedEntity for declaration, or None if not a function declaration.
+    """
+    function_name = extract_function_declaration_name(node)
+    if not function_name:
+        return None
+
+    if namespace_stack:
+        qualified_name = normalize_cpp_entity_name("::".join(namespace_stack + [function_name]))
+    else:
+        qualified_name = function_name
+
+    comment_node, code_node, is_templated = get_effective_node_for_extraction(node)
+    docstring = get_preceding_comments(comment_node, source_bytes)
+    code_text = source_bytes[code_node.start_byte:code_node.end_byte].decode("utf-8")
+
+    global_uri = ExtractedEntity.create_uri(
+        repo_name=repo_name,
+        file_path=file_path,
+        entity_type="Function",
+        entity_name=qualified_name,
+    )
+
+    return ExtractedEntity(
+        global_uri=global_uri,
+        repo_name=repo_name,
+        file_path=file_path,
+        entity_type="Function",
+        entity_name=qualified_name,
+        docstring=docstring,
+        code_text=code_text,
+        start_line=code_node.start_point.row + 1,
+        end_line=code_node.end_point.row + 1,
+        is_templated=is_templated,
+    )
 
 
 def detect_macro_broken_class(node: Node, source_bytes: bytes) -> Optional[tuple]:
@@ -279,7 +386,7 @@ def detect_macro_broken_class(node: Node, source_bytes: bytes) -> Optional[tuple
         # Extract the declarator (which should be the class/struct name)
         declarator = node.child_by_field_name("declarator")
         if declarator and declarator.text:
-            name = declarator.text.decode("utf-8")
+            name = normalize_cpp_entity_name(declarator.text.decode("utf-8"))
             entity_type = "Class" if stripped.startswith("class ") else "Struct"
             logger.info(f"Detected macro-broken {entity_type} '{name}' at line {node.start_point.row + 1}")
             return (entity_type, name)
@@ -339,6 +446,7 @@ def extract_entity_from_node(
         qualified_name = "::".join(namespace_stack + [entity_name])
     else:
         qualified_name = entity_name
+    qualified_name = normalize_cpp_entity_name(qualified_name)
     
     # Get effective nodes for extraction
     comment_node, code_node, is_templated = get_effective_node_for_extraction(node)
@@ -383,7 +491,10 @@ def traverse_and_extract(
     source_bytes: bytes,
     repo_name: str,
     file_path: str,
-    namespace_stack: Optional[List[str]] = None
+    namespace_stack: Optional[List[str]] = None,
+    include_declarations: bool = DEFAULT_INCLUDE_DECLARATIONS,
+    extern_c_declarations: bool = DEFAULT_EXTERN_C_DECLARATIONS,
+    extern_context: bool = False,
 ) -> List[ExtractedEntity]:
     """Recursively traverse AST and extract all entities.
     
@@ -396,6 +507,11 @@ def traverse_and_extract(
         repo_name: Repository name for URI generation.
         file_path: File path relative to repo root.
         namespace_stack: Current namespace qualification stack.
+        include_declarations: Whether to extract declaration-only functions.
+        extern_c_declarations: Whether to extract declaration-only functions
+            from inside extern "C" wrappers.
+        extern_context: Internal flag indicating traversal is currently inside
+            an extern "C" context.
         
     Returns:
         List of all extracted entities found in the tree.
@@ -431,6 +547,21 @@ def traverse_and_extract(
                         if entity:
                             entities.append(entity)
                         break
+                    if _should_extract_declaration(
+                        include_declarations=include_declarations,
+                        extern_context=extern_context,
+                        extern_c_declarations=extern_c_declarations,
+                    ):
+                        decl_entity = extract_declaration_entity(
+                            template_child,
+                            source_bytes,
+                            repo_name,
+                            file_path,
+                            namespace_stack,
+                        )
+                        if decl_entity:
+                            entities.append(decl_entity)
+                            break
         
         # Handle namespace definitions - recurse with updated stack
         elif child.type == NAMESPACE_NODE:
@@ -442,7 +573,16 @@ def traverse_and_extract(
             body = child.child_by_field_name("body")
             if body:
                 entities.extend(
-                    traverse_and_extract(body, source_bytes, repo_name, file_path, new_stack)
+                    traverse_and_extract(
+                        body,
+                        source_bytes,
+                        repo_name,
+                        file_path,
+                        new_stack,
+                        include_declarations=include_declarations,
+                        extern_c_declarations=extern_c_declarations,
+                        extern_context=extern_context,
+                    )
                 )
         
         # Handle declaration nodes (classes can be wrapped in these)
@@ -454,6 +594,20 @@ def traverse_and_extract(
                 )
                 if entity:
                     entities.append(entity)
+            elif _should_extract_declaration(
+                include_declarations=include_declarations,
+                extern_context=extern_context,
+                extern_c_declarations=extern_c_declarations,
+            ):
+                decl_entity = extract_declaration_entity(
+                    child,
+                    source_bytes,
+                    repo_name,
+                    file_path,
+                    namespace_stack,
+                )
+                if decl_entity:
+                    entities.append(decl_entity)
         
         # Handle direct entity nodes
         elif child.type in TARGET_ENTITY_TYPES:
@@ -467,77 +621,48 @@ def traverse_and_extract(
         elif child.type in TRANSPARENT_WRAPPERS:
             body = child.child_by_field_name("body")
             if body:
-                # BUG FIX #3: In extern "C" blocks, extract function declarations as well
-                # because they represent the C API interface
-                for extern_child in body.children:
-                    if not extern_child.is_named:
-                        continue
-                    
-                    # Handle function declarations inside extern "C"
-                    if extern_child.type == DECLARATION_NODE:
-                        declarator = extern_child.child_by_field_name("declarator")
-                        if declarator and declarator.type == "function_declarator":
-                            # This is a function declaration - extract it
-                            name_node = declarator.child_by_field_name("declarator")
-                            if name_node and name_node.text:
-                                func_name = name_node.text.decode("utf-8")
-                                
-                                # Qualify with namespace
-                                if namespace_stack:
-                                    qualified_name = "::".join(namespace_stack + [func_name])
-                                else:
-                                    qualified_name = func_name
-                                
-                                # Get comments
-                                docstring = get_preceding_comments(extern_child, source_bytes)
-                                
-                                # Extract code text
-                                code_text = source_bytes[extern_child.start_byte:extern_child.end_byte].decode("utf-8")
-                                
-                                # Create entity
-                                global_uri = ExtractedEntity.create_uri(
-                                    repo_name=repo_name,
-                                    file_path=file_path,
-                                    entity_type="Function",
-                                    entity_name=qualified_name
-                                )
-                                
-                                entity = ExtractedEntity(
-                                    global_uri=global_uri,
-                                    repo_name=repo_name,
-                                    file_path=file_path,
-                                    entity_type="Function",
-                                    entity_name=qualified_name,
-                                    docstring=docstring,
-                                    code_text=code_text,
-                                    start_line=extern_child.start_point.row + 1,
-                                    end_line=extern_child.end_point.row + 1,
-                                    is_templated=False
-                                )
-                                entities.append(entity)
-                                logger.debug(f"Extracted extern C function: {qualified_name}")
-                        else:
-                            # For other declarations, recurse normally
-                            entities.extend(
-                                traverse_and_extract(extern_child, source_bytes, repo_name, file_path, namespace_stack)
-                            )
-                    else:
-                        # For non-declaration nodes, recurse normally
-                        entities.extend(
-                            traverse_and_extract(extern_child, source_bytes, repo_name, file_path, namespace_stack)
-                        )
+                entities.extend(
+                    traverse_and_extract(
+                        body,
+                        source_bytes,
+                        repo_name,
+                        file_path,
+                        namespace_stack,
+                        include_declarations=include_declarations,
+                        extern_c_declarations=extern_c_declarations,
+                        extern_context=True,
+                    )
+                )
         
         # Handle preprocessor containers (#ifdef, #ifndef, etc.)
         elif child.type in PREPROCESSOR_CONTAINERS:
             # Preprocessor directives have children we need to traverse
             entities.extend(
-                traverse_and_extract(child, source_bytes, repo_name, file_path, namespace_stack)
+                traverse_and_extract(
+                    child,
+                    source_bytes,
+                    repo_name,
+                    file_path,
+                    namespace_stack,
+                    include_declarations=include_declarations,
+                    extern_c_declarations=extern_c_declarations,
+                    extern_context=extern_context,
+                )
             )
         
         # Handle other container types - recurse
         elif child.type in CONTAINER_TYPES:
             entities.extend(
-                traverse_and_extract(child, source_bytes, repo_name, file_path, namespace_stack)
+                traverse_and_extract(
+                    child,
+                    source_bytes,
+                    repo_name,
+                    file_path,
+                    namespace_stack,
+                    include_declarations=include_declarations,
+                    extern_c_declarations=extern_c_declarations,
+                    extern_context=extern_context,
+                )
             )
     
     return entities
@@ -547,7 +672,9 @@ def extract_entities_from_tree(
     tree: Tree,
     source_bytes: bytes,
     repo_name: str,
-    file_path: str
+    file_path: str,
+    include_declarations: bool = DEFAULT_INCLUDE_DECLARATIONS,
+    extern_c_declarations: bool = DEFAULT_EXTERN_C_DECLARATIONS,
 ) -> List[ExtractedEntity]:
     """Extract all entities from a parsed C++ AST.
     
@@ -558,11 +685,21 @@ def extract_entities_from_tree(
         source_bytes: The raw source file bytes.
         repo_name: Repository name for URI generation.
         file_path: File path relative to repo root.
+        include_declarations: Whether to extract declaration-only functions.
+        extern_c_declarations: Whether to include declaration-only functions
+            inside extern "C" contexts.
         
     Returns:
         List of all extracted entities.
     """
     logger.info(f"Extracting entities from {file_path}")
-    entities = traverse_and_extract(tree.root_node, source_bytes, repo_name, file_path)
+    entities = traverse_and_extract(
+        tree.root_node,
+        source_bytes,
+        repo_name,
+        file_path,
+        include_declarations=include_declarations,
+        extern_c_declarations=extern_c_declarations,
+    )
     logger.info(f"Extracted {len(entities)} entities from {file_path}")
     return entities

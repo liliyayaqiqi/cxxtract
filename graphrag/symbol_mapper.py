@@ -31,7 +31,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-from extraction.models import ExtractedEntity
+from core.uri_contract import create_global_uri, normalize_cpp_entity_name
 from graphrag.config import IGNORED_NAMESPACES, MONITORED_NAMESPACES
 
 logger = logging.getLogger(__name__)
@@ -295,7 +295,7 @@ def parse_scip_symbol(scip_symbol: str, kind: int = 0) -> Optional[ParsedScipSym
         scheme=scheme,
         namespace_parts=namespace_parts,
         entity_type=entity_type,
-        entity_name=entity_name,
+        entity_name=normalize_cpp_entity_name(entity_name),
         is_external=is_external,
         is_local=False,
         is_macro=False,
@@ -403,8 +403,7 @@ def scip_symbol_to_global_uri(
     if parsed.is_external and file_path == "":
         file_path = "<external>"
     
-    # Use the ExtractedEntity.create_uri factory method for consistency
-    return ExtractedEntity.create_uri(
+    return create_global_uri(
         repo_name=repo_name,
         file_path=file_path,
         entity_type=parsed.entity_type,

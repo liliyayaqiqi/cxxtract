@@ -70,3 +70,7 @@ ENTITY_TYPE_MAP: dict = {
     "struct_specifier": "Struct",
     "function_definition": "Function",
 }
+
+# Extraction policy defaults
+DEFAULT_INCLUDE_DECLARATIONS: bool = False
+DEFAULT_EXTERN_C_DECLARATIONS: bool = False

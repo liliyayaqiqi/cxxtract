@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from core.uri_contract import parse_global_uri
 from neo4j import GraphDatabase, Driver, Session
 
 from graphrag.config import (
@@ -215,10 +216,9 @@ def _build_nodes_from_symbols(
         if global_uri is None:
             continue
         
-        # Parse entity_type and entity_name from URI
-        # Format: repo::file::type::name
-        parts = global_uri.split("::")
-        if len(parts) < 4:
+        try:
+            parsed_uri = parse_global_uri(global_uri)
+        except ValueError:
             logger.warning(f"Malformed global_uri: {global_uri}")
             continue
         
@@ -227,8 +227,8 @@ def _build_nodes_from_symbols(
                 global_uri=global_uri,
                 repo_name=repo_name,
                 file_path=sym.file_path,
-                entity_type=parts[2],
-                entity_name="::".join(parts[3:]),
+                entity_type=parsed_uri["entity_type"],
+                entity_name=parsed_uri["entity_name"],
                 scip_symbol=sym.scip_symbol,
                 is_external=False,  # Defined in this repo's SCIP index
             )
