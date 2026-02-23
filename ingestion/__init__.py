@@ -10,6 +10,7 @@ from ingestion.qdrant_loader import (
     init_collection,
     ingest_entities,
     ingest_from_jsonl,
+    fetch_documents_by_identity_keys,
     IngestionStats,
 )
 from ingestion.embedding import generate_mock_embedding
@@ -19,6 +20,7 @@ __all__ = [
     "init_collection",
     "ingest_entities",
     "ingest_from_jsonl",
+    "fetch_documents_by_identity_keys",
     "IngestionStats",
     "generate_mock_embedding",
 ]

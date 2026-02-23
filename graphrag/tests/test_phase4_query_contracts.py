@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from graphrag.query import (
+    AffectedEntity,
     calculate_blast_radius,
+    fetch_qdrant_documents_for_affected_entities,
+    fetch_qdrant_documents_for_identity_keys,
     get_entity_neighbors,
     get_inheritance_tree,
 )
@@ -65,7 +69,7 @@ class TestPhase4BlastRadiusContract(unittest.TestCase):
     def test_empty_result_returns_typed_status(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"uri": "repo::f.cpp::Function::run"}],  # root lookup
+                [{"root_count": 1}],  # root lookup
                 [],  # blast query
             ]
         )
@@ -103,7 +107,7 @@ class TestPhase4BlastRadiusContract(unittest.TestCase):
         ]
         driver = _FakeDriver(
             responses=[
-                [{"uri": "repo::f.cpp::Function::run"}],
+                [{"root_count": 1}],
                 records,
             ]
         )
@@ -117,7 +121,7 @@ class TestPhase4BlastRadiusContract(unittest.TestCase):
 
         cursor_driver = _FakeDriver(
             responses=[
-                [{"uri": "repo::f.cpp::Function::run"}],
+                [{"root_count": 1}],
                 [],
             ]
         )
@@ -129,6 +133,42 @@ class TestPhase4BlastRadiusContract(unittest.TestCase):
         blast_call_params = cursor_driver.calls[1]["params"]
         self.assertEqual(blast_call_params["cursor_depth"], 2)
         self.assertEqual(blast_call_params["cursor_uri"], "repo::b.cpp::Function::B")
+
+    def test_identity_key_selector_is_supported(self) -> None:
+        driver = _FakeDriver(
+            responses=[
+                [{"root_count": 1}],
+                [],
+            ]
+        )
+        calculate_blast_radius(
+            None,
+            driver,
+            identity_key="repo::f.cpp::Function::run::sig_deadbeef",
+        )
+        self.assertEqual(
+            driver.calls[0]["params"]["entity_id"],
+            "repo::f.cpp::Function::run::sig_deadbeef",
+        )
+        self.assertIn("start.identity_key = $entity_id", driver.calls[0]["query"])
+        self.assertNotIn("LIMIT 1", driver.calls[0]["query"])
+
+    def test_scip_symbol_selector_is_supported(self) -> None:
+        driver = _FakeDriver(
+            responses=[
+                [{"root_count": 1}],
+                [],
+            ]
+        )
+        calculate_blast_radius(
+            None,
+            driver,
+            scip_symbol="cxx . . $ YAML/add(aaaa).",
+            owner_repo="repo",
+        )
+        self.assertEqual(driver.calls[0]["params"]["scip_symbol"], "cxx . . $ YAML/add(aaaa).")
+        self.assertEqual(driver.calls[0]["params"]["owner_repo"], "repo")
+        self.assertIn("start.scip_symbol = $scip_symbol", driver.calls[0]["query"])
 
     def test_invalid_cursor_raises(self) -> None:
         driver = _FakeDriver(responses=[])
@@ -153,22 +193,22 @@ class TestPhase4NeighborContract(unittest.TestCase):
     def test_neighbors_default_to_entity_only(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"uri": "repo::f.cpp::Function::run"}],  # root
-                [{"uri": "repo::a.cpp::Function::A", "type": "Function", "relationship": "CALLS"}],
-                [{"uri": "repo::b.h::Class::B", "type": "Class", "relationship": "USES_TYPE"}],
+                [{"root_count": 1}],  # root
+                [{"identity_key": "repo::a.cpp::Function::A", "uri": "repo::a.cpp::Function::A", "type": "Function", "relationship": "CALLS"}],
+                [{"identity_key": "repo::b.h::Class::B", "uri": "repo::b.h::Class::B", "type": "Class", "relationship": "USES_TYPE"}],
             ]
         )
         result = get_entity_neighbors("repo::f.cpp::Function::run", driver)
         self.assertEqual(len(result["inbound"]), 1)
         self.assertEqual(len(result["outbound"]), 1)
         self.assertEqual(result["metadata"].status, "ok")
-        self.assertIn("(src:Entity)-[r]->(tgt:Entity", driver.calls[1]["query"])
-        self.assertIn("(src:Entity {global_uri: $uri})-[r]->(tgt:Entity)", driver.calls[2]["query"])
+        self.assertIn("MATCH (src:Entity)-[r]->(start)", driver.calls[1]["query"])
+        self.assertIn("MATCH (start)-[r]->(tgt:Entity)", driver.calls[2]["query"])
 
     def test_neighbors_can_include_non_entity_nodes(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"uri": "repo::f.cpp::Function::run"}],
+                [{"root_count": 1}],
                 [],
                 [],
             ]
@@ -178,8 +218,8 @@ class TestPhase4NeighborContract(unittest.TestCase):
             driver,
             include_non_entity=True,
         )
-        self.assertIn("MATCH (src)-[r]->(tgt:Entity", driver.calls[1]["query"])
-        self.assertIn("MATCH (src:Entity {global_uri: $uri})-[r]->(tgt)", driver.calls[2]["query"])
+        self.assertIn("MATCH (src)-[r]->(start)", driver.calls[1]["query"])
+        self.assertIn("MATCH (start)-[r]->(tgt)", driver.calls[2]["query"])
 
     def test_neighbors_missing_root_returns_status(self) -> None:
         driver = _FakeDriver(responses=[[]])
@@ -200,15 +240,73 @@ class TestPhase4InheritanceContract(unittest.TestCase):
     def test_inheritance_queries_use_deterministic_order(self) -> None:
         driver = _FakeDriver(
             responses=[
-                [{"uri": "repo::x.h::Class::Node"}],  # root
-                [{"uri": "repo::a.h::Class::Base"}],  # ancestors
-                [{"uri": "repo::z.h::Class::Derived"}],  # descendants
+                [{"root_count": 1}],  # root
+                [{"uri": "repo::a.h::Class::Base", "identity_key": "repo::a.h::Class::Base"}],  # ancestors
+                [{"uri": "repo::z.h::Class::Derived", "identity_key": "repo::z.h::Class::Derived"}],  # descendants
             ]
         )
         result = get_inheritance_tree("repo::x.h::Class::Node", driver)
         self.assertEqual(result["metadata"].status, "ok")
-        self.assertIn("ORDER BY depth ASC, uri ASC", driver.calls[1]["query"])
-        self.assertIn("ORDER BY depth ASC, uri ASC", driver.calls[2]["query"])
+        self.assertIn("ORDER BY depth ASC, identity_key ASC", driver.calls[1]["query"])
+        self.assertIn("ORDER BY depth ASC, identity_key ASC", driver.calls[2]["query"])
+
+
+class TestPhase4JoinContract(unittest.TestCase):
+    @patch("ingestion.qdrant_loader.fetch_documents_by_identity_keys")
+    def test_join_fetch_uses_identity_keys(self, mock_fetch) -> None:
+        mock_fetch.return_value = {
+            "repo::a.cpp::Function::A::sig_1": {"identity_key": "repo::a.cpp::Function::A::sig_1"}
+        }
+        result = fetch_qdrant_documents_for_identity_keys(
+            identity_keys=["repo::a.cpp::Function::A::sig_1"],
+            qdrant_client=object(),
+            collection_name="code_entities",
+        )
+        self.assertIn("repo::a.cpp::Function::A::sig_1", result)
+        kwargs = mock_fetch.call_args.kwargs
+        self.assertEqual(
+            kwargs["identity_keys"],
+            ["repo::a.cpp::Function::A::sig_1"],
+        )
+
+    @patch("ingestion.qdrant_loader.fetch_documents_by_identity_keys")
+    def test_join_fetch_from_affected_entities_uses_identity_key_not_global_uri(self, mock_fetch) -> None:
+        mock_fetch.return_value = {}
+        entities = [
+            AffectedEntity(
+                identity_key="repo::math.cpp::Function::add::sig_a1",
+                global_uri="repo::math.cpp::Function::add",
+                scip_symbol="cxx . . $ add(a1).",
+                entity_type="Function",
+                entity_name="add",
+                file_path="math.cpp",
+                depth=1,
+                relationship_chain=["CALLS"],
+            ),
+            AffectedEntity(
+                identity_key="repo::math.cpp::Function::add::sig_b2",
+                global_uri="repo::math.cpp::Function::add",
+                scip_symbol="cxx . . $ add(b2).",
+                entity_type="Function",
+                entity_name="add",
+                file_path="math.cpp",
+                depth=1,
+                relationship_chain=["CALLS"],
+            ),
+        ]
+        fetch_qdrant_documents_for_affected_entities(
+            affected_entities=entities,
+            qdrant_client=object(),
+            collection_name="code_entities",
+        )
+        kwargs = mock_fetch.call_args.kwargs
+        self.assertEqual(
+            kwargs["identity_keys"],
+            [
+                "repo::math.cpp::Function::add::sig_a1",
+                "repo::math.cpp::Function::add::sig_b2",
+            ],
+        )
 
 
 if __name__ == "__main__":

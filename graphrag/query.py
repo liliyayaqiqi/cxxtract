@@ -7,7 +7,7 @@ Uses Neo4j's index-free adjacency for O(1) traversal performance.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence
 
 from neo4j import Driver, Query
 
@@ -37,7 +37,9 @@ class QueryMetadata:
 class AffectedEntity:
     """An entity affected by a change (upstream) or depended upon (downstream)."""
     
+    identity_key: str
     global_uri: str
+    scip_symbol: str
     entity_type: str
     entity_name: str
     file_path: str
@@ -75,10 +77,10 @@ def _sanitize_relationship_types(
 
 
 def _decode_cursor(cursor: str) -> tuple[int, str]:
-    """Decode pagination cursor format '<depth>|<global_uri>'."""
+    """Decode pagination cursor format '<depth>|<identity_key>'."""
     parts = cursor.split("|", 1)
     if len(parts) != 2:
-        raise ValueError("Invalid cursor format. Expected '<depth>|<global_uri>'")
+        raise ValueError("Invalid cursor format. Expected '<depth>|<identity_key>'")
     try:
         depth = int(parts[0])
     except ValueError as exc:
@@ -93,9 +95,63 @@ def _encode_cursor(depth: int, uri: str) -> str:
     return f"{depth}|{uri}"
 
 
+def _resolve_entity_selector(
+    *,
+    identity_key: Optional[str],
+    scip_symbol: Optional[str],
+    owner_repo: Optional[str],
+    global_uri: Optional[str],
+) -> tuple[str, dict[str, object], str]:
+    """Build Cypher predicate/params for selecting root entities.
+
+    Selection precedence:
+    1. ``identity_key`` (unique entity)
+    2. ``scip_symbol`` (+ optional ``owner_repo``)
+    3. ``global_uri`` (symbol family; may map to multiple overload entities)
+    """
+    selectors = [
+        identity_key is not None,
+        scip_symbol is not None,
+        global_uri is not None,
+    ]
+    if sum(selectors) > 1:
+        raise ValueError(
+            "Provide only one of identity_key, scip_symbol, or global_uri"
+        )
+
+    if identity_key is not None:
+        return (
+            "start.identity_key = $entity_id",
+            {"entity_id": identity_key},
+            identity_key,
+        )
+
+    if scip_symbol is not None:
+        predicate = "start.scip_symbol = $scip_symbol"
+        params: dict[str, object] = {"scip_symbol": scip_symbol}
+        if owner_repo is not None:
+            predicate += " AND start.owner_repo = $owner_repo"
+            params["owner_repo"] = owner_repo
+            origin = f"{owner_repo}:{scip_symbol}"
+        else:
+            origin = scip_symbol
+        return predicate, params, origin
+
+    if global_uri is not None:
+        # global_uri is a symbol-family identifier and may correspond to
+        # multiple entities (e.g., overloaded functions).
+        return (
+            "start.global_uri = $global_uri",
+            {"global_uri": global_uri},
+            global_uri,
+        )
+
+    raise ValueError("One of identity_key, scip_symbol, or global_uri is required")
+
+
 def calculate_blast_radius(
-    global_uri: str,
-    driver: Driver,
+    global_uri: Optional[str] = None,
+    driver: Optional[Driver] = None,
     max_depth: int = 5,
     direction: Literal["upstream", "downstream"] = "upstream",
     repo_name: Optional[str] = None,
@@ -103,6 +159,10 @@ def calculate_blast_radius(
     max_results: Optional[int] = None,
     cursor: Optional[str] = None,
     query_timeout_s: float = DEFAULT_QUERY_TIMEOUT_S,
+    *,
+    identity_key: Optional[str] = None,
+    scip_symbol: Optional[str] = None,
+    owner_repo: Optional[str] = None,
 ) -> BlastRadiusResult:
     """Calculate the blast radius for a given code entity.
     
@@ -116,7 +176,8 @@ def calculate_blast_radius(
     Leverages Neo4j's index-free adjacency for O(1) edge traversal.
     
     Args:
-        global_uri: The Global URI of the entity to analyze.
+        global_uri: Legacy selector. Represents a symbol family, not always a
+            unique entity (overloads may share the same value).
         driver: Connected Neo4j driver.
         max_depth: Maximum number of hops to traverse (default 5).
         direction: "upstream" or "downstream".
@@ -125,6 +186,9 @@ def calculate_blast_radius(
         max_results: Optional page size limit.
         cursor: Optional pagination cursor from previous call.
         query_timeout_s: Per-query timeout in seconds.
+        identity_key: Preferred unique selector for one entity.
+        scip_symbol: Alternative selector (optionally disambiguated by owner_repo).
+        owner_repo: Owner repo filter when selecting by scip_symbol.
         
     Returns:
         BlastRadiusResult with all affected entities.
@@ -140,9 +204,20 @@ def calculate_blast_radius(
         >>> for entity in result.affected_entities:
         ...     print(f"{entity.depth} hops: {entity.entity_name}")
     """
+    if driver is None:
+        raise ValueError("driver is required")
+
+    selector_predicate, selector_params, origin_id = _resolve_entity_selector(
+        identity_key=identity_key,
+        scip_symbol=scip_symbol,
+        owner_repo=owner_repo,
+        global_uri=global_uri,
+    )
     logger.info(
-        f"Calculating {direction} blast radius for {global_uri} "
-        f"(max_depth={max_depth})"
+        "Calculating %s blast radius for %s (max_depth=%d)",
+        direction,
+        origin_id,
+        max_depth,
     )
     if max_depth < 1:
         raise ValueError("max_depth must be >= 1")
@@ -156,25 +231,27 @@ def calculate_blast_radius(
         cursor_depth, cursor_uri = _decode_cursor(cursor)
     
     result = BlastRadiusResult(
-        origin_uri=global_uri,
+        origin_uri=origin_id,
         direction=direction,
         metadata=QueryMetadata(query_timeout_s=query_timeout_s),
     )
 
     with driver.session() as session:
         root_query = Query(
-            """
-            MATCH (start:Entity {global_uri: $uri})
-            WHERE $repo_name IS NULL OR start.repo_name = $repo_name
-            RETURN start.global_uri AS uri
-            LIMIT 1
+            f"""
+            MATCH (start:Entity)
+            WHERE {selector_predicate}
+              AND ($repo_name IS NULL OR start.repo_name = $repo_name)
+            RETURN count(start) AS root_count
             """,
             timeout=query_timeout_s,
         )
         root_record = session.run(
-            root_query, uri=global_uri, repo_name=repo_name
+            root_query,
+            **selector_params,
+            repo_name=repo_name,
         ).single()
-        if root_record is None:
+        if root_record is None or root_record["root_count"] == 0:
             result.metadata.status = "missing_root"
             result.metadata.reason = "origin_not_found"
             return result
@@ -191,36 +268,39 @@ def calculate_blast_radius(
     pattern = pattern % ("|".join(rel_types), max_depth)
 
     query = f"""
-    MATCH (start:Entity {{global_uri: $uri}})
-    WHERE $repo_name IS NULL OR start.repo_name = $repo_name
+    MATCH (start:Entity)
+    WHERE {selector_predicate}
+      AND ($repo_name IS NULL OR start.repo_name = $repo_name)
     MATCH path = {pattern}
     WHERE $repo_name IS NULL OR affected.repo_name = $repo_name
-    WITH affected, length(path) AS depth, [rel IN relationships(path) | type(rel)] AS chain
+    WITH affected, affected.identity_key AS affected_identity, length(path) AS depth, [rel IN relationships(path) | type(rel)] AS chain
     WITH affected, depth, chain, reduce(acc = '', rel IN chain | acc + '|' + rel) AS chain_key
-    ORDER BY affected.global_uri ASC, depth ASC, chain_key ASC
-    WITH affected, collect({{depth: depth, chain: chain}})[0] AS best
-    WITH affected, best.depth AS depth, best.chain AS chain
+    ORDER BY affected_identity ASC, depth ASC, chain_key ASC
+    WITH affected, affected_identity, collect({{depth: depth, chain: chain}})[0] AS best
+    WITH affected, affected_identity, best.depth AS depth, best.chain AS chain
     WHERE $cursor_depth IS NULL
       OR depth > $cursor_depth
-      OR (depth = $cursor_depth AND affected.global_uri > $cursor_uri)
+      OR (depth = $cursor_depth AND affected_identity > $cursor_uri)
     RETURN
+        affected_identity AS identity_key,
         affected.global_uri AS uri,
+        affected.scip_symbol AS scip_symbol,
         affected.entity_type AS type,
         affected.entity_name AS name,
         affected.file_path AS file,
         depth,
         chain
-    ORDER BY depth ASC, uri ASC
+    ORDER BY depth ASC, identity_key ASC
     """
     if max_results is not None:
         query += "\nLIMIT $limit"
 
     run_params = {
-        "uri": global_uri,
         "repo_name": repo_name,
         "cursor_depth": cursor_depth,
         "cursor_uri": cursor_uri,
     }
+    run_params.update(selector_params)
     if max_results is not None:
         run_params["limit"] = max_results + 1
 
@@ -237,12 +317,15 @@ def calculate_blast_radius(
         if max_results is not None and len(records) > max_results:
             visible_records = records[:max_results]
             last_visible = visible_records[-1]
-            next_cursor = _encode_cursor(last_visible["depth"], last_visible["uri"])
+            cursor_identity = last_visible.get("identity_key") or last_visible["uri"]
+            next_cursor = _encode_cursor(last_visible["depth"], cursor_identity)
 
         for record in visible_records:
             result.affected_entities.append(
                 AffectedEntity(
+                    identity_key=record.get("identity_key") or record["uri"],
                     global_uri=record["uri"],
+                    scip_symbol=record.get("scip_symbol") or "",
                     entity_type=record["type"],
                     entity_name=record["name"],
                     file_path=record["file"],
@@ -271,24 +354,31 @@ def calculate_blast_radius(
 
 
 def get_entity_neighbors(
-    global_uri: str,
-    driver: Driver,
+    global_uri: Optional[str] = None,
+    driver: Optional[Driver] = None,
     include_non_entity: bool = False,
     relationship_types: Optional[Sequence[str]] = None,
     repo_name: Optional[str] = None,
     max_results: int = DEFAULT_NEIGHBOR_LIMIT,
     query_timeout_s: float = DEFAULT_QUERY_TIMEOUT_S,
+    *,
+    identity_key: Optional[str] = None,
+    scip_symbol: Optional[str] = None,
+    owner_repo: Optional[str] = None,
 ) -> dict[str, object]:
     """Get immediate neighbors (1-hop) of an entity.
     
     Args:
-        global_uri: The Global URI to query.
+        global_uri: Legacy selector for symbol family.
         driver: Connected Neo4j driver.
         include_non_entity: Whether to include non-Entity neighbor nodes.
         relationship_types: Optional relationship types to include.
         repo_name: Optional repository filter.
         max_results: Max inbound/outbound records to return each.
         query_timeout_s: Per-query timeout in seconds.
+        identity_key: Preferred unique selector.
+        scip_symbol: Alternative selector.
+        owner_repo: Optional owner-repo filter with scip_symbol.
         
     Returns:
         Dict with keys "inbound" and "outbound", each containing a list of
@@ -296,24 +386,32 @@ def get_entity_neighbors(
     """
     if max_results < 1:
         raise ValueError("max_results must be >= 1")
+    if driver is None:
+        raise ValueError("driver is required")
     rel_types = _sanitize_relationship_types(relationship_types)
+    selector_predicate, selector_params, _ = _resolve_entity_selector(
+        identity_key=identity_key,
+        scip_symbol=scip_symbol,
+        owner_repo=owner_repo,
+        global_uri=global_uri,
+    )
 
     metadata = QueryMetadata(query_timeout_s=query_timeout_s)
     with driver.session() as session:
         root_record = session.run(
             Query(
-                """
-                MATCH (start:Entity {global_uri: $uri})
-                WHERE $repo_name IS NULL OR start.repo_name = $repo_name
-                RETURN start.global_uri AS uri
-                LIMIT 1
+                f"""
+                MATCH (start:Entity)
+                WHERE {selector_predicate}
+                  AND ($repo_name IS NULL OR start.repo_name = $repo_name)
+                RETURN count(start) AS root_count
                 """,
                 timeout=query_timeout_s,
             ),
-            uri=global_uri,
+            **selector_params,
             repo_name=repo_name,
         ).single()
-        if root_record is None:
+        if root_record is None or root_record["root_count"] == 0:
             metadata.status = "missing_root"
             metadata.reason = "origin_not_found"
             return {"inbound": [], "outbound": [], "metadata": metadata}
@@ -322,18 +420,26 @@ def get_entity_neighbors(
         tgt_label = "" if include_non_entity else ":Entity"
 
         inbound_query = f"""
-        MATCH (src{src_label})-[r]->(tgt:Entity {{global_uri: $uri}})
+        MATCH (start:Entity)
+        WHERE {selector_predicate}
+          AND ($repo_name IS NULL OR start.repo_name = $repo_name)
+        MATCH (src{src_label})-[r]->(start)
         WHERE type(r) IN $rel_types
           AND ($repo_name IS NULL OR src.repo_name = $repo_name)
-        RETURN src.global_uri AS uri, src.entity_type AS type, type(r) AS relationship
-        ORDER BY relationship ASC, uri ASC
+        RETURN DISTINCT src.identity_key AS identity_key, src.global_uri AS uri, src.entity_type AS type, type(r) AS relationship
+        ORDER BY relationship ASC, identity_key ASC
         LIMIT $limit
         """
         inbound = [
-            {"uri": rec["uri"], "type": rec["type"], "relationship": rec["relationship"]}
+            {
+                "identity_key": rec.get("identity_key") or rec["uri"],
+                "uri": rec["uri"],
+                "type": rec["type"],
+                "relationship": rec["relationship"],
+            }
             for rec in session.run(
                 Query(inbound_query, timeout=query_timeout_s),
-                uri=global_uri,
+                **selector_params,
                 rel_types=rel_types,
                 repo_name=repo_name,
                 limit=max_results,
@@ -341,18 +447,26 @@ def get_entity_neighbors(
         ]
 
         outbound_query = f"""
-        MATCH (src:Entity {{global_uri: $uri}})-[r]->(tgt{tgt_label})
+        MATCH (start:Entity)
+        WHERE {selector_predicate}
+          AND ($repo_name IS NULL OR start.repo_name = $repo_name)
+        MATCH (start)-[r]->(tgt{tgt_label})
         WHERE type(r) IN $rel_types
           AND ($repo_name IS NULL OR tgt.repo_name = $repo_name)
-        RETURN tgt.global_uri AS uri, tgt.entity_type AS type, type(r) AS relationship
-        ORDER BY relationship ASC, uri ASC
+        RETURN DISTINCT tgt.identity_key AS identity_key, tgt.global_uri AS uri, tgt.entity_type AS type, type(r) AS relationship
+        ORDER BY relationship ASC, identity_key ASC
         LIMIT $limit
         """
         outbound = [
-            {"uri": rec["uri"], "type": rec["type"], "relationship": rec["relationship"]}
+            {
+                "identity_key": rec.get("identity_key") or rec["uri"],
+                "uri": rec["uri"],
+                "type": rec["type"],
+                "relationship": rec["relationship"],
+            }
             for rec in session.run(
                 Query(outbound_query, timeout=query_timeout_s),
-                uri=global_uri,
+                **selector_params,
                 rel_types=rel_types,
                 repo_name=repo_name,
                 limit=max_results,
@@ -367,78 +481,99 @@ def get_entity_neighbors(
 
 
 def get_inheritance_tree(
-    global_uri: str,
-    driver: Driver,
+    global_uri: Optional[str] = None,
+    driver: Optional[Driver] = None,
     repo_name: Optional[str] = None,
     max_results: int = DEFAULT_NEIGHBOR_LIMIT,
     query_timeout_s: float = DEFAULT_QUERY_TIMEOUT_S,
+    *,
+    identity_key: Optional[str] = None,
+    scip_symbol: Optional[str] = None,
+    owner_repo: Optional[str] = None,
 ) -> dict[str, object]:
     """Get the full inheritance hierarchy for a class.
     
     Args:
-        global_uri: The Global URI of a Class/Struct entity.
+        global_uri: Legacy selector for symbol family.
         driver: Connected Neo4j driver.
         repo_name: Optional repository filter.
         max_results: Max ancestors/descendants to return each.
         query_timeout_s: Per-query timeout in seconds.
+        identity_key: Preferred unique selector.
+        scip_symbol: Alternative selector.
+        owner_repo: Optional owner-repo filter with scip_symbol.
         
     Returns:
         Dict with keys "ancestors" (base classes) and "descendants" (derived classes).
     """
     if max_results < 1:
         raise ValueError("max_results must be >= 1")
+    if driver is None:
+        raise ValueError("driver is required")
+    selector_predicate, selector_params, _ = _resolve_entity_selector(
+        identity_key=identity_key,
+        scip_symbol=scip_symbol,
+        owner_repo=owner_repo,
+        global_uri=global_uri,
+    )
 
     metadata = QueryMetadata(query_timeout_s=query_timeout_s)
     with driver.session() as session:
         root_record = session.run(
             Query(
-                """
-                MATCH (root:Entity {global_uri: $uri})
-                WHERE $repo_name IS NULL OR root.repo_name = $repo_name
-                RETURN root.global_uri AS uri
-                LIMIT 1
+                f"""
+                MATCH (root:Entity)
+                WHERE {selector_predicate}
+                  AND ($repo_name IS NULL OR root.repo_name = $repo_name)
+                RETURN count(root) AS root_count
                 """,
                 timeout=query_timeout_s,
             ),
-            uri=global_uri,
+            **selector_params,
             repo_name=repo_name,
         ).single()
-        if root_record is None:
+        if root_record is None or root_record["root_count"] == 0:
             metadata.status = "missing_root"
             metadata.reason = "origin_not_found"
             return {"ancestors": [], "descendants": [], "metadata": metadata}
 
-        ancestors_query = """
-        MATCH path = (child:Entity {global_uri: $uri})-[:INHERITS*1..]->(ancestor:Entity)
+        ancestors_query = f"""
+        MATCH (root:Entity)
+        WHERE {selector_predicate}
+          AND ($repo_name IS NULL OR root.repo_name = $repo_name)
+        MATCH path = (root)-[:INHERITS*1..]->(ancestor:Entity)
         WHERE $repo_name IS NULL OR ancestor.repo_name = $repo_name
-        WITH ancestor.global_uri AS uri, min(length(path)) AS depth
-        RETURN uri
-        ORDER BY depth ASC, uri ASC
+        WITH ancestor.identity_key AS identity_key, ancestor.global_uri AS uri, min(length(path)) AS depth
+        RETURN uri, identity_key
+        ORDER BY depth ASC, identity_key ASC
         LIMIT $limit
         """
         ancestors = [
             rec["uri"]
             for rec in session.run(
                 Query(ancestors_query, timeout=query_timeout_s),
-                uri=global_uri,
+                **selector_params,
                 repo_name=repo_name,
                 limit=max_results,
             )
         ]
 
-        descendants_query = """
-        MATCH path = (descendant:Entity)-[:INHERITS*1..]->(base:Entity {global_uri: $uri})
+        descendants_query = f"""
+        MATCH (root:Entity)
+        WHERE {selector_predicate}
+          AND ($repo_name IS NULL OR root.repo_name = $repo_name)
+        MATCH path = (descendant:Entity)-[:INHERITS*1..]->(root)
         WHERE $repo_name IS NULL OR descendant.repo_name = $repo_name
-        WITH descendant.global_uri AS uri, min(length(path)) AS depth
-        RETURN uri
-        ORDER BY depth ASC, uri ASC
+        WITH descendant.identity_key AS identity_key, descendant.global_uri AS uri, min(length(path)) AS depth
+        RETURN uri, identity_key
+        ORDER BY depth ASC, identity_key ASC
         LIMIT $limit
         """
         descendants = [
             rec["uri"]
             for rec in session.run(
                 Query(descendants_query, timeout=query_timeout_s),
-                uri=global_uri,
+                **selector_params,
                 repo_name=repo_name,
                 limit=max_results,
             )
@@ -449,3 +584,40 @@ def get_inheritance_tree(
         metadata.reason = "no_inheritance_relationships"
 
     return {"ancestors": ancestors, "descendants": descendants, "metadata": metadata}
+
+
+def fetch_qdrant_documents_for_identity_keys(
+    identity_keys: Sequence[str],
+    qdrant_client: Any,
+    collection_name: Optional[str] = None,
+    with_vectors: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Fetch Qdrant payloads by identity_key for Neo4j join results."""
+    if collection_name is None:
+        from ingestion.config import DEFAULT_COLLECTION_NAME
+
+        collection_name = DEFAULT_COLLECTION_NAME
+    from ingestion.qdrant_loader import fetch_documents_by_identity_keys
+
+    return fetch_documents_by_identity_keys(
+        client=qdrant_client,
+        identity_keys=identity_keys,
+        collection_name=collection_name,
+        with_vectors=with_vectors,
+    )
+
+
+def fetch_qdrant_documents_for_affected_entities(
+    affected_entities: Sequence[AffectedEntity],
+    qdrant_client: Any,
+    collection_name: Optional[str] = None,
+    with_vectors: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Fetch Qdrant payloads for blast-radius entities using identity_key."""
+    identity_keys = [entity.identity_key for entity in affected_entities if entity.identity_key]
+    return fetch_qdrant_documents_for_identity_keys(
+        identity_keys=identity_keys,
+        qdrant_client=qdrant_client,
+        collection_name=collection_name,
+        with_vectors=with_vectors,
+    )

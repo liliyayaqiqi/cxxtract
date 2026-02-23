@@ -28,6 +28,7 @@ from ingestion.qdrant_loader import (
     ingest_entities,
     ingest_from_jsonl,
     iter_jsonl_entity_batches,
+    fetch_documents_by_identity_keys,
     get_qdrant_client,
     init_collection,
     IngestionStats,
@@ -228,6 +229,63 @@ class TestBuildPoint(unittest.TestCase):
 
         with self.assertRaises(KeyError):
             build_point(bad_entity, self.vector)
+
+
+class TestIdentityKeyRetrieval(unittest.TestCase):
+    """Join-contract retrieval tests by identity_key."""
+
+    def test_fetch_documents_by_identity_keys_returns_expected_payloads(self):
+        mock_client = Mock()
+        point_a = Mock()
+        point_a.payload = {
+            "identity_key": "repo::f.cpp::Function::add::sig_a1",
+            "global_uri": "repo::f.cpp::Function::add",
+            "entity_name": "add",
+        }
+        point_a.vector = [0.1, 0.2]
+        point_a.id = "p-a"
+
+        point_b = Mock()
+        point_b.payload = {
+            "identity_key": "repo::f.cpp::Function::add::sig_b2",
+            "global_uri": "repo::f.cpp::Function::add",
+            "entity_name": "add",
+        }
+        point_b.vector = [0.3, 0.4]
+        point_b.id = "p-b"
+
+        mock_client.scroll.side_effect = [
+            ([point_a], None),
+            ([point_b], None),
+        ]
+
+        docs = fetch_documents_by_identity_keys(
+            client=mock_client,
+            identity_keys=[
+                "repo::f.cpp::Function::add::sig_a1",
+                "repo::f.cpp::Function::add::sig_b2",
+            ],
+            with_vectors=True,
+        )
+
+        self.assertEqual(len(docs), 2)
+        self.assertEqual(
+            docs["repo::f.cpp::Function::add::sig_a1"]["global_uri"],
+            "repo::f.cpp::Function::add",
+        )
+        self.assertEqual(
+            docs["repo::f.cpp::Function::add::sig_b2"]["global_uri"],
+            "repo::f.cpp::Function::add",
+        )
+        self.assertNotEqual(
+            docs["repo::f.cpp::Function::add::sig_a1"]["vector"],
+            docs["repo::f.cpp::Function::add::sig_b2"]["vector"],
+        )
+
+        first_filter = mock_client.scroll.call_args_list[0].kwargs["scroll_filter"]
+        cond = first_filter.must[0]
+        self.assertEqual(cond.key, "identity_key")
+        self.assertEqual(cond.match.value, "repo::f.cpp::Function::add::sig_a1")
 
 
 class TestIngestEntities(unittest.TestCase):
@@ -755,6 +813,32 @@ class TestInitCollection(unittest.TestCase):
                 vector_dimension=256,
                 recreate=False,
             )
+
+    def test_init_collection_existing_collection_ensures_identity_key_index(self):
+        mock_client = Mock()
+        mock_client.collection_exists.return_value = True
+        vectors = Mock()
+        vectors.size = 256
+        params = Mock()
+        params.vectors = vectors
+        config = Mock()
+        config.params = params
+        collection_info = Mock()
+        collection_info.config = config
+        mock_client.get_collection.return_value = collection_info
+
+        init_collection(
+            mock_client,
+            collection_name="existing_collection",
+            vector_dimension=256,
+            recreate=False,
+        )
+
+        indexed_fields = [
+            call.kwargs["field_name"]
+            for call in mock_client.create_payload_index.call_args_list
+        ]
+        self.assertIn("identity_key", indexed_fields)
 
 
 class TestEndToEndIntegration(unittest.TestCase):

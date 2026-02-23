@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, asdict, field
-from typing import Iterable, Iterator, List, Dict, Any, Optional, Callable
+from typing import Iterable, Iterator, List, Dict, Any, Optional, Callable, Sequence
 
 from qdrant_client import QdrantClient, models
 from core.uri_contract import build_identity_key
@@ -42,6 +42,15 @@ from ingestion.config import (
 from ingestion.embedding import get_embeddings
 
 logger = logging.getLogger(__name__)
+
+_INDEXED_PAYLOAD_FIELDS = [
+    "global_uri",
+    "identity_key",
+    "repo_name",
+    "file_path",
+    "entity_type",
+    "entity_name",
+]
 
 
 @dataclass
@@ -258,16 +267,7 @@ def init_collection(
 
             # CRITICAL: Create payload indices for hybrid search performance.
             # Without these, Qdrant performs full-scan on filtered queries.
-            indexed_fields = [
-                "global_uri",
-                "identity_key",
-                "repo_name",
-                "file_path",
-                "entity_type",
-                "entity_name",
-            ]
-
-            for field_name in indexed_fields:
+            for field_name in _INDEXED_PAYLOAD_FIELDS:
                 client.create_payload_index(
                     collection_name=collection_name,
                     field_name=field_name,
@@ -277,7 +277,7 @@ def init_collection(
 
             logger.info(
                 f"Collection '{collection_name}' created with "
-                f"{len(indexed_fields)} payload indices"
+                f"{len(_INDEXED_PAYLOAD_FIELDS)} payload indices"
             )
         else:
             collection_info = client.get_collection(collection_name)
@@ -291,6 +291,13 @@ def init_collection(
             logger.info(
                 f"Collection '{collection_name}' already exists, skipping creation"
             )
+            # Ensure join-critical payload indexes exist for existing collections.
+            for field_name in _INDEXED_PAYLOAD_FIELDS:
+                client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
 
     except Exception as e:
         logger.error(f"Failed to initialize collection '{collection_name}': {e}")
@@ -408,6 +415,62 @@ def build_point(
         vector=vector,
         payload=payload,
     )
+
+
+def fetch_documents_by_identity_keys(
+    client: QdrantClient,
+    identity_keys: Sequence[str],
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    with_vectors: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Fetch Qdrant payloads by identity_key for graph/vector joins.
+
+    Returns a map keyed by identity_key.  When multiple points are found for the
+    same key (unexpected), chooses one deterministically by global_uri/file_path.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+    seen: set[str] = set()
+    for key in identity_keys:
+        if key and key not in seen:
+            seen.add(key)
+            ordered_keys.append(key)
+
+    for identity_key in ordered_keys:
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="identity_key",
+                        match=models.MatchValue(value=identity_key),
+                    )
+                ]
+            ),
+            limit=10,
+            with_payload=True,
+            with_vectors=with_vectors,
+        )
+        if not points:
+            continue
+
+        # Deterministic tie-breaker for unexpected duplicates.
+        chosen = sorted(
+            points,
+            key=lambda p: (
+                str((p.payload or {}).get("global_uri", "")),
+                str((p.payload or {}).get("file_path", "")),
+                str(getattr(p, "id", "")),
+            ),
+        )[0]
+
+        payload = dict(chosen.payload or {})
+        payload["identity_key"] = identity_key
+        if with_vectors:
+            payload["vector"] = getattr(chosen, "vector", None)
+        found[identity_key] = payload
+
+    return found
 
 
 def iter_jsonl_entity_batches(
