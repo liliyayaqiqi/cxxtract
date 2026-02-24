@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import NotRequired, TypedDict
+from typing import TypedDict
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
 
 GLOBAL_URI_SEPARATOR = "::"
 

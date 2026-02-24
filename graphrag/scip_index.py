@@ -65,6 +65,9 @@ def run_scip_clang(
         f"Running SCIP indexer: {SCIP_CLANG_PATH} on {compdb_path}"
     )
     logger.debug(f"Full command: {' '.join(cmd)}")
+
+    # NEW: Deduce the project root (assuming compdb is in build/)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(compdb_path)))
     
     try:
         result = subprocess.run(
@@ -72,6 +75,7 @@ def run_scip_clang(
             check=True,
             capture_output=True,
             text=True,
+            cwd=project_root,  # Run from project root for better relative paths
         )
         
         # Log scip-clang output
