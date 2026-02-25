@@ -40,6 +40,7 @@ class ScipSymbolDef:
     kind: int                   # SymbolInformation.Kind enum value
     display_name: str           # SymbolInformation.display_name
     disposition: str = "keep"   # keep|stub after namespace/locality classification
+    is_local_definition: bool = False
     definition_range: Optional[tuple[int, int, int, int]] = None
     relationships: list[ScipRelationship] = field(default_factory=list)
 
@@ -297,6 +298,7 @@ def _parse_document(
                 kind=sym_info.kind,
                 display_name=sym_info.display_name,
                 disposition=disposition,
+                is_local_definition=(sym_info.symbol in local_definition_symbols),
                 definition_range=definition_ranges.get(sym_info.symbol),
                 relationships=rels,
             )

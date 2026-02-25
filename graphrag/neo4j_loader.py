@@ -28,6 +28,10 @@ from graphrag.symbol_mapper import (
     parse_scip_symbol,
     resolve_symbol_owner_repo,
 )
+from graphrag.workspace_catalog import (
+    WorkspaceSymbolCatalog,
+    build_workspace_symbol_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,7 @@ class GraphEdge:
     src_scip_symbol: Optional[str] = None
     tgt_owner_repo: Optional[str] = None
     tgt_scip_symbol: Optional[str] = None
+    is_cross_repo: bool = False
 
 
 @dataclass
@@ -243,6 +248,50 @@ def _validate_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
 _validate_edges.last_dropped_counts = {}  # type: ignore[attr-defined]
 
 
+def _symbol_is_local_definition(symbol: ScipSymbolDef) -> bool:
+    """Return True when symbol is locally defined in current parsed index."""
+    return bool(getattr(symbol, "is_local_definition", symbol.disposition != "stub"))
+
+
+def _resolve_owner_repo_for_symbol(
+    scip_symbol: str,
+    *,
+    current_repo_name: str,
+    kind: int,
+    workspace_catalog: Optional[WorkspaceSymbolCatalog] = None,
+) -> str:
+    """Resolve owner repo with workspace catalog as primary source."""
+    if workspace_catalog is not None:
+        owner = workspace_catalog.resolve_owner_repo(scip_symbol)
+        if owner:
+            return owner
+    return resolve_symbol_owner_repo(
+        scip_symbol,
+        current_repo_name=current_repo_name,
+        kind=kind,
+    )
+
+
+def _resolve_owner_file_for_symbol(
+    scip_symbol: str,
+    *,
+    owner_repo: str,
+    local_symbol_file_map: dict[str, str],
+    workspace_catalog: Optional[WorkspaceSymbolCatalog] = None,
+    default_file: str = "<external>",
+) -> str:
+    """Resolve owner file path for symbol from local map/catalog/default."""
+    if owner_repo in {"", None}:  # type: ignore[comparison-overlap]
+        return default_file
+
+    if workspace_catalog is not None:
+        owner_file = workspace_catalog.resolve_owner_file(owner_repo, scip_symbol)
+        if owner_file:
+            return owner_file
+
+    return local_symbol_file_map.get(scip_symbol, default_file)
+
+
 def get_neo4j_driver() -> Driver:
     """Connect to Neo4j using configuration from docker-compose.yml.
     
@@ -362,6 +411,8 @@ def clear_repo_graph(driver: Driver, repo_name: str) -> None:
 def _build_nodes_from_symbols(
     symbols: list[ScipSymbolDef],
     repo_name: str,
+    symbol_file_map: Optional[dict[str, str]] = None,
+    workspace_catalog: Optional[WorkspaceSymbolCatalog] = None,
 ) -> list[GraphNode]:
     """Convert SCIP symbol definitions to GraphNode objects.
     
@@ -378,19 +429,28 @@ def _build_nodes_from_symbols(
         List of GraphNode objects (may be fewer than symbols due to filtering).
     """
     nodes: list[GraphNode] = []
+    local_file_map = symbol_file_map or {sym.scip_symbol: sym.file_path for sym in symbols}
     
     for sym in symbols:
-        is_stub_symbol = sym.disposition == "stub"
-        owner_repo = (
-            resolve_symbol_owner_repo(
+        owner_repo = _resolve_owner_repo_for_symbol(
+            sym.scip_symbol,
+            current_repo_name=repo_name,
+            kind=sym.kind,
+            workspace_catalog=workspace_catalog,
+        )
+        is_local = _symbol_is_local_definition(sym)
+        is_stub_symbol = sym.disposition == "stub" or (is_local and owner_repo != repo_name)
+        uri_file_path = (
+            _resolve_owner_file_for_symbol(
                 sym.scip_symbol,
-                current_repo_name=repo_name,
-                kind=sym.kind,
+                owner_repo=owner_repo,
+                local_symbol_file_map=local_file_map,
+                workspace_catalog=workspace_catalog,
+                default_file="<external>",
             )
             if is_stub_symbol
-            else repo_name
+            else sym.file_path
         )
-        uri_file_path = "<external>" if is_stub_symbol else sym.file_path
         
         global_uri = scip_symbol_to_global_uri(
             sym.scip_symbol,
@@ -443,6 +503,7 @@ def _build_edges_from_relationships(
     stub_nodes: list[GraphNode],
     symbol_file_map: dict[str, str],
     symbol_kind_map: dict[str, int],
+    workspace_catalog: Optional[WorkspaceSymbolCatalog] = None,
 ) -> list[GraphEdge]:
     """Extract edges from SCIP symbol relationships.
     
@@ -470,17 +531,26 @@ def _build_edges_from_relationships(
     seen_stubs: set[tuple[str, str]] = set()  # Deduplicate stubs by owner/symbol
     
     for sym in symbols:
-        src_is_stub = sym.disposition == "stub"
-        src_repo_name = (
-            resolve_symbol_owner_repo(
+        src_repo_name = _resolve_owner_repo_for_symbol(
+            sym.scip_symbol,
+            current_repo_name=repo_name,
+            kind=sym.kind,
+            workspace_catalog=workspace_catalog,
+        )
+        src_is_stub = sym.disposition == "stub" or (
+            _symbol_is_local_definition(sym) and src_repo_name != repo_name
+        )
+        src_file_path = (
+            _resolve_owner_file_for_symbol(
                 sym.scip_symbol,
-                current_repo_name=repo_name,
-                kind=sym.kind,
+                owner_repo=src_repo_name,
+                local_symbol_file_map=symbol_file_map,
+                workspace_catalog=workspace_catalog,
+                default_file="<external>",
             )
             if src_is_stub
-            else repo_name
+            else sym.file_path
         )
-        src_file_path = "<external>" if src_is_stub else sym.file_path
         src_uri = scip_symbol_to_global_uri(
             sym.scip_symbol,
             src_file_path,
@@ -507,11 +577,18 @@ def _build_edges_from_relationships(
             # SCIP relationships do NOT carry the target's file path;
             # only the raw symbol string.  We must look it up.
             if tgt_disposition == "stub":
-                tgt_file_path = symbol_file_map.get(rel.target_symbol, "<external>")
-                tgt_repo_name = resolve_symbol_owner_repo(
+                tgt_repo_name = _resolve_owner_repo_for_symbol(
                     rel.target_symbol,
                     current_repo_name=repo_name,
                     kind=tgt_kind,
+                    workspace_catalog=workspace_catalog,
+                )
+                tgt_file_path = _resolve_owner_file_for_symbol(
+                    rel.target_symbol,
+                    owner_repo=tgt_repo_name,
+                    local_symbol_file_map=symbol_file_map,
+                    workspace_catalog=workspace_catalog,
+                    default_file="<external>",
                 )
                 if tgt_repo_name != repo_name:
                     logger.debug(
@@ -524,7 +601,12 @@ def _build_edges_from_relationships(
                 tgt_file_path = symbol_file_map.get(
                     rel.target_symbol, sym.file_path
                 )
-                tgt_repo_name = repo_name
+                tgt_repo_name = _resolve_owner_repo_for_symbol(
+                    rel.target_symbol,
+                    current_repo_name=repo_name,
+                    kind=tgt_kind,
+                    workspace_catalog=workspace_catalog,
+                )
             
             tgt_uri = scip_symbol_to_global_uri(
                 rel.target_symbol,
@@ -544,7 +626,15 @@ def _build_edges_from_relationships(
             )
             # Create a stub node for cross-repo targets
             tgt_stub_key = (tgt_repo_name, rel.target_symbol)
-            if tgt_disposition == "stub" and tgt_stub_key not in seen_stubs:
+            has_owner_in_catalog = (
+                workspace_catalog is not None
+                and workspace_catalog.resolve_owner_repo(rel.target_symbol) is not None
+            )
+            if (
+                tgt_disposition == "stub"
+                and not has_owner_in_catalog
+                and tgt_stub_key not in seen_stubs
+            ):
                 seen_stubs.add(tgt_stub_key)
 
                 if parsed_tgt:
@@ -585,6 +675,7 @@ def _build_edges_from_relationships(
                             tgt_owner_repo=tgt_repo_name,
                             tgt_scip_symbol=rel.target_symbol,
                             relationship_type=rel_type,
+                            is_cross_repo=(src_repo_name != tgt_repo_name),
                         )
                     )
             
@@ -606,6 +697,7 @@ def _build_edges_from_relationships(
                         tgt_owner_repo=tgt_repo_name,
                         tgt_scip_symbol=rel.target_symbol,
                         relationship_type="USES_TYPE",
+                        is_cross_repo=(src_repo_name != tgt_repo_name),
                     )
                 )
     
@@ -618,6 +710,7 @@ def _build_edges_from_references(
     stub_nodes: list[GraphNode],
     symbol_file_map: dict[str, str],
     symbol_kind_map: dict[str, int],
+    workspace_catalog: Optional[WorkspaceSymbolCatalog] = None,
 ) -> list[GraphEdge]:
     """Extract CALLS edges from reference occurrences.
     
@@ -657,10 +750,23 @@ def _build_edges_from_references(
         enclosing_file = symbol_file_map.get(
             ref.enclosing_symbol, ref.file_path
         )
+        src_owner_repo = _resolve_owner_repo_for_symbol(
+            ref.enclosing_symbol,
+            current_repo_name=repo_name,
+            kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
+            workspace_catalog=workspace_catalog,
+        )
+        enclosing_file = _resolve_owner_file_for_symbol(
+            ref.enclosing_symbol,
+            owner_repo=src_owner_repo,
+            local_symbol_file_map=symbol_file_map,
+            workspace_catalog=workspace_catalog,
+            default_file=enclosing_file,
+        )
         src_uri = scip_symbol_to_global_uri(
             ref.enclosing_symbol,
             enclosing_file,
-            repo_name,
+            src_owner_repo,
             kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
             include_function_sig=False,
         )
@@ -685,11 +791,18 @@ def _build_edges_from_references(
         # ref.file_path is where the reference *occurs*, NOT where
         # the target is defined — those are usually different files.
         if tgt_disposition == "stub":
-            tgt_file = symbol_file_map.get(ref.scip_symbol, "<external>")
-            tgt_repo_name = resolve_symbol_owner_repo(
+            tgt_repo_name = _resolve_owner_repo_for_symbol(
                 ref.scip_symbol,
                 current_repo_name=repo_name,
                 kind=tgt_kind,
+                workspace_catalog=workspace_catalog,
+            )
+            tgt_file = _resolve_owner_file_for_symbol(
+                ref.scip_symbol,
+                owner_repo=tgt_repo_name,
+                local_symbol_file_map=symbol_file_map,
+                workspace_catalog=workspace_catalog,
+                default_file="<external>",
             )
             if tgt_repo_name != repo_name:
                 logger.debug(
@@ -699,8 +812,19 @@ def _build_edges_from_references(
                     tgt_repo_name,
                 )
         else:
-            tgt_file = symbol_file_map.get(ref.scip_symbol, ref.file_path)
-            tgt_repo_name = repo_name
+            tgt_repo_name = _resolve_owner_repo_for_symbol(
+                ref.scip_symbol,
+                current_repo_name=repo_name,
+                kind=tgt_kind,
+                workspace_catalog=workspace_catalog,
+            )
+            tgt_file = _resolve_owner_file_for_symbol(
+                ref.scip_symbol,
+                owner_repo=tgt_repo_name,
+                local_symbol_file_map=symbol_file_map,
+                workspace_catalog=workspace_catalog,
+                default_file=symbol_file_map.get(ref.scip_symbol, ref.file_path),
+            )
         
         tgt_uri = scip_symbol_to_global_uri(
             ref.scip_symbol,
@@ -720,7 +844,15 @@ def _build_edges_from_references(
         )
         # Create stub node for cross-repo targets
         tgt_stub_key = (tgt_repo_name, ref.scip_symbol)
-        if tgt_disposition == "stub" and tgt_stub_key not in seen_stubs:
+        has_owner_in_catalog = (
+            workspace_catalog is not None
+            and workspace_catalog.resolve_owner_repo(ref.scip_symbol) is not None
+        )
+        if (
+            tgt_disposition == "stub"
+            and not has_owner_in_catalog
+            and tgt_stub_key not in seen_stubs
+        ):
             seen_stubs.add(tgt_stub_key)
 
             if parsed_tgt:
@@ -757,19 +889,165 @@ def _build_edges_from_references(
             GraphEdge(
                 src_uri=src_uri,
                 tgt_uri=tgt_uri,
-                src_owner_repo=resolve_symbol_owner_repo(
-                    ref.enclosing_symbol,
-                    current_repo_name=repo_name,
-                    kind=symbol_kind_map.get(ref.enclosing_symbol, 0),
-                ),
+                src_owner_repo=src_owner_repo,
                 src_scip_symbol=ref.enclosing_symbol,
                 tgt_owner_repo=tgt_repo_name,
                 tgt_scip_symbol=ref.scip_symbol,
                 relationship_type=rel_type,
+                is_cross_repo=(src_owner_repo != tgt_repo_name),
             )
         )
     
     return edges
+
+
+def _merge_nodes(
+    driver: Driver,
+    nodes: list[GraphNode],
+    batch_size: int,
+    stats: IngestionStats,
+    fallback_ingestion_repo: str,
+) -> None:
+    """Merge node batches into Neo4j."""
+    with driver.session() as session:
+        logger.info("Phase 1: Merging nodes...")
+        nodes_by_type: dict[str, list[GraphNode]] = {}
+        for node in nodes:
+            nodes_by_type.setdefault(node.entity_type, []).append(node)
+
+        for entity_type, type_nodes in nodes_by_type.items():
+            for i in range(0, len(type_nodes), batch_size):
+                batch = type_nodes[i : i + batch_size]
+                node_dicts = [
+                    {
+                        "global_uri": n.global_uri,
+                        "identity_key": n.identity_key or n.global_uri,
+                        "function_sig_hash": n.function_sig_hash,
+                        "repo_name": n.repo_name,
+                        "ingestion_repo": n.ingestion_repo or fallback_ingestion_repo,
+                        "owner_repo": n.owner_repo or n.repo_name,
+                        "file_path": n.file_path,
+                        "entity_type": n.entity_type,
+                        "entity_name": n.entity_name,
+                        "scip_symbol": n.scip_symbol,
+                        "is_external": n.is_external,
+                    }
+                    for n in batch
+                ]
+                result = session.run(
+                    f"""
+                    UNWIND $nodes AS n
+                    MERGE (e:Entity:{entity_type} {{owner_repo: n.owner_repo, scip_symbol: n.scip_symbol}})
+                    SET e.repo_name = n.repo_name,
+                        e.global_uri = n.global_uri,
+                        e.identity_key = n.identity_key,
+                        e.function_sig_hash = n.function_sig_hash,
+                        e.ingestion_repo = coalesce(e.ingestion_repo, n.ingestion_repo),
+                        e.owner_repo = n.owner_repo,
+                        e.file_path = n.file_path,
+                        e.entity_type = n.entity_type,
+                        e.entity_name = n.entity_name,
+                        e.scip_symbol = n.scip_symbol,
+                        e.is_external = n.is_external
+                    RETURN count(e) AS count
+                    """,
+                    nodes=node_dicts,
+                )
+                stats.nodes_created += result.single()["count"]
+                stats.batches_sent += 1
+        logger.info(f"Phase 1 complete: {stats.nodes_created} nodes merged")
+
+
+def _merge_edges(
+    driver: Driver,
+    edges: list[GraphEdge],
+    batch_size: int,
+    stats: IngestionStats,
+) -> None:
+    """Merge relationship edges into Neo4j."""
+    with driver.session() as session:
+        logger.info("Phase 2: Merging edges...")
+        edges_by_type: dict[str, list[GraphEdge]] = {}
+        for edge in edges:
+            edges_by_type.setdefault(edge.relationship_type, []).append(edge)
+
+        for rel_type, type_edges in edges_by_type.items():
+            for i in range(0, len(type_edges), batch_size):
+                batch = type_edges[i : i + batch_size]
+                edge_dicts = [
+                    {
+                        "src_owner_repo": e.src_owner_repo,
+                        "src_scip_symbol": e.src_scip_symbol,
+                        "tgt_owner_repo": e.tgt_owner_repo,
+                        "tgt_scip_symbol": e.tgt_scip_symbol,
+                        "is_cross_repo": e.is_cross_repo,
+                    }
+                    for e in batch
+                ]
+                try:
+                    result = session.run(
+                        f"""
+                        UNWIND $edges AS e
+                        MATCH (src:Entity {{owner_repo: e.src_owner_repo, scip_symbol: e.src_scip_symbol}})
+                        MATCH (tgt:Entity {{owner_repo: e.tgt_owner_repo, scip_symbol: e.tgt_scip_symbol}})
+                        MERGE (src)-[r:{rel_type}]->(tgt)
+                        SET r.is_cross_repo = e.is_cross_repo
+                        RETURN count(r) AS count
+                        """,
+                        edges=edge_dicts,
+                    )
+                    stats.edges_created += result.single()["count"]
+                    stats.batches_sent += 1
+                except Exception as e:
+                    logger.error(f"Failed to merge {rel_type} edges: {e}")
+                    stats.errors += len(batch)
+        logger.info(f"Phase 2 complete: {stats.edges_created} edges merged")
+
+
+def _merge_defined_in_edges(
+    driver: Driver,
+    nodes: list[GraphNode],
+    batch_size: int,
+    stats: IngestionStats,
+) -> None:
+    """Create DEFINED_IN edges from Entity nodes to File nodes."""
+    with driver.session() as session:
+        logger.info("Phase 3: Creating DEFINED_IN file edges...")
+        entities_by_file: dict[tuple[str, str], list[dict[str, str]]] = {}
+        for node in nodes:
+            if node.file_path == "<external>":
+                continue
+            key = (node.repo_name, node.file_path)
+            entities_by_file.setdefault(key, []).append(
+                {
+                    "owner_repo": node.owner_repo or node.repo_name,
+                    "scip_symbol": node.scip_symbol,
+                }
+            )
+
+        file_dicts = [
+            {"repo_name": repo, "file_path": file_path, "entities": entities}
+            for (repo, file_path), entities in entities_by_file.items()
+        ]
+
+        for i in range(0, len(file_dicts), batch_size):
+            batch = file_dicts[i : i + batch_size]
+            session.run(
+                """
+                UNWIND $files AS f
+                MERGE (file:File {path: f.file_path, repo_name: f.repo_name})
+                WITH file, f
+                UNWIND f.entities AS ent
+                MATCH (e:Entity {owner_repo: ent.owner_repo, scip_symbol: ent.scip_symbol})
+                MERGE (e)-[:DEFINED_IN]->(file)
+                """,
+                files=batch,
+            )
+            stats.batches_sent += 1
+        logger.info(
+            "Phase 3 complete: DEFINED_IN edges created for %d files",
+            len(entities_by_file),
+        )
 
 
 def ingest_graph(
@@ -777,6 +1055,8 @@ def ingest_graph(
     driver: Driver,
     repo_name: str,
     batch_size: int = NEO4J_BATCH_SIZE,
+    workspace_catalog: WorkspaceSymbolCatalog | None = None,
+    defer_edge_write: bool = False,
 ) -> IngestionStats:
     """Ingest SCIP parse result into Neo4j graph database.
     
@@ -815,13 +1095,19 @@ def ingest_graph(
     
     # Build nodes and edges (stub_nodes accumulates cross-repo placeholders)
     stub_nodes: list[GraphNode] = []
-    nodes = _build_nodes_from_symbols(parse_result.symbols, repo_name)
+    nodes = _build_nodes_from_symbols(
+        parse_result.symbols,
+        repo_name,
+        symbol_file_map=symbol_file_map,
+        workspace_catalog=workspace_catalog,
+    )
     rel_edges = _build_edges_from_relationships(
         parse_result.symbols,
         repo_name,
         stub_nodes,
         symbol_file_map,
         symbol_kind_map,
+        workspace_catalog=workspace_catalog,
     )
     ref_edges = _build_edges_from_references(
         parse_result.references,
@@ -829,6 +1115,7 @@ def ingest_graph(
         stub_nodes,
         symbol_file_map,
         symbol_kind_map,
+        workspace_catalog=workspace_catalog,
     )
     
     all_nodes_raw = nodes + stub_nodes
@@ -851,156 +1138,93 @@ def ingest_graph(
         f"({len(rel_edges)} from relationships, {len(ref_edges)} from references)"
     )
     
-    with driver.session() as session:
-        # Phase 1: MERGE nodes (batched by entity_type for labeling)
-        # all_nodes includes both local nodes and cross-repo stub nodes
-        logger.info("Phase 1: Merging nodes...")
-        
-        nodes_by_type: dict[str, list[GraphNode]] = {}
-        for node in all_nodes:
-            nodes_by_type.setdefault(node.entity_type, []).append(node)
-        
-        for entity_type, type_nodes in nodes_by_type.items():
-            for i in range(0, len(type_nodes), batch_size):
-                batch = type_nodes[i : i + batch_size]
-                
-                node_dicts = [
-                    {
-                        "global_uri": n.global_uri,
-                        "identity_key": n.identity_key or n.global_uri,
-                        "function_sig_hash": n.function_sig_hash,
-                        "repo_name": n.repo_name,
-                        "ingestion_repo": n.ingestion_repo or repo_name,
-                        "owner_repo": n.owner_repo or n.repo_name,
-                        "file_path": n.file_path,
-                        "entity_type": n.entity_type,
-                        "entity_name": n.entity_name,
-                        "scip_symbol": n.scip_symbol,
-                        "is_external": n.is_external,
-                    }
-                    for n in batch
-                ]
-                
-                # Use entity-type-specific labels (no APOC dependency)
-                result = session.run(
-                    f"""
-                    UNWIND $nodes AS n
-                    MERGE (e:Entity:{entity_type} {{owner_repo: n.owner_repo, scip_symbol: n.scip_symbol}})
-                    SET e.repo_name = n.repo_name,
-                        e.global_uri = n.global_uri,
-                        e.identity_key = n.identity_key,
-                        e.function_sig_hash = n.function_sig_hash,
-                        e.ingestion_repo = coalesce(e.ingestion_repo, n.ingestion_repo),
-                        e.owner_repo = n.owner_repo,
-                        e.file_path = n.file_path,
-                        e.entity_type = n.entity_type,
-                        e.entity_name = n.entity_name,
-                        e.scip_symbol = n.scip_symbol,
-                        e.is_external = n.is_external
-                    RETURN count(e) AS count
-                    """,
-                    nodes=node_dicts,
-                )
-                
-                count = result.single()["count"]
-                stats.nodes_created += count
-                stats.batches_sent += 1
-                
-                logger.debug(
-                    f"Merged {count} {entity_type} nodes "
-                    f"(total: {stats.nodes_created})"
-                )
-        
-        logger.info(f"Phase 1 complete: {stats.nodes_created} nodes merged")
-        
-        # Phase 2: MERGE edges (batched by relationship_type)
-        logger.info("Phase 2: Merging edges...")
-        
-        edges_by_type: dict[str, list[GraphEdge]] = {}
-        for edge in all_edges:
-            edges_by_type.setdefault(edge.relationship_type, []).append(edge)
-        
-        for rel_type, type_edges in edges_by_type.items():
-            for i in range(0, len(type_edges), batch_size):
-                batch = type_edges[i : i + batch_size]
-                
-                edge_dicts = [
-                    {
-                        "src_owner_repo": e.src_owner_repo,
-                        "src_scip_symbol": e.src_scip_symbol,
-                        "tgt_owner_repo": e.tgt_owner_repo,
-                        "tgt_scip_symbol": e.tgt_scip_symbol,
-                    }
-                    for e in batch
-                ]
-                
-                try:
-                    result = session.run(
-                        f"""
-                        UNWIND $edges AS e
-                        MATCH (src:Entity {{owner_repo: e.src_owner_repo, scip_symbol: e.src_scip_symbol}})
-                        MATCH (tgt:Entity {{owner_repo: e.tgt_owner_repo, scip_symbol: e.tgt_scip_symbol}})
-                        MERGE (src)-[r:{rel_type}]->(tgt)
-                        RETURN count(r) AS count
-                        """,
-                        edges=edge_dicts,
-                    )
-                    
-                    count = result.single()["count"]
-                    stats.edges_created += count
-                    stats.batches_sent += 1
-                    
-                    logger.debug(
-                        f"Merged {count} {rel_type} edges "
-                        f"(total: {stats.edges_created})"
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"Failed to merge {rel_type} edges: {e}")
-                    stats.errors += len(batch)
-        
-        logger.info(f"Phase 2 complete: {stats.edges_created} edges merged")
-        
-        # Phase 3: DEFINED_IN edges (group entities by file)
-        logger.info("Phase 3: Creating DEFINED_IN file edges...")
-        
-        entities_by_file: dict[str, list[dict[str, str]]] = {}
-        for node in all_nodes:
-            # Skip stubs from DEFINED_IN — they don't have a real file
-            if node.file_path == "<external>":
-                continue
-            entities_by_file.setdefault(node.file_path, []).append(
-                {
-                    "owner_repo": node.owner_repo or node.repo_name,
-                    "scip_symbol": node.scip_symbol,
-                }
-            )
-        
-        file_dicts = [
-            {"file_path": fp, "repo_name": repo_name, "entities": entities}
-            for fp, entities in entities_by_file.items()
-        ]
-        
-        for i in range(0, len(file_dicts), batch_size):
-            batch = file_dicts[i : i + batch_size]
-            
-            session.run(
-                """
-                UNWIND $files AS f
-                MERGE (file:File {path: f.file_path, repo_name: f.repo_name})
-                WITH file, f
-                UNWIND f.entities AS ent
-                MATCH (e:Entity {owner_repo: ent.owner_repo, scip_symbol: ent.scip_symbol})
-                MERGE (e)-[:DEFINED_IN]->(file)
-                """,
-                files=batch,
-            )
-            
-            stats.batches_sent += 1
-        
-        logger.info(f"Phase 3 complete: DEFINED_IN edges created for {len(entities_by_file)} files")
+    _merge_nodes(driver, all_nodes, batch_size, stats, fallback_ingestion_repo=repo_name)
+    if defer_edge_write:
+        logger.info("Skipping edge write phase (defer_edge_write=True)")
+        logger.info(f"Graph ingestion complete (nodes-only): {stats}")
+        return stats
+
+    _merge_edges(driver, all_edges, batch_size, stats)
+    _merge_defined_in_edges(driver, all_nodes, batch_size, stats)
     
     logger.info(f"Graph ingestion complete: {stats}")
+    return stats
+
+
+def ingest_workspace_graph(
+    repo_parse_results: list[tuple[str, ScipParseResult]],
+    driver: Driver,
+    batch_size: int = NEO4J_BATCH_SIZE,
+    workspace_catalog: WorkspaceSymbolCatalog | None = None,
+) -> IngestionStats:
+    """Ingest multiple repositories in global two-pass order.
+
+    Pass 1: materialize all nodes across repos.
+    Pass 2: materialize all edges across repos.
+    """
+    stats = IngestionStats()
+    if workspace_catalog is None:
+        workspace_catalog = build_workspace_symbol_catalog(repo_parse_results)
+
+    all_nodes_raw: list[GraphNode] = []
+    all_edges_raw: list[GraphEdge] = []
+
+    for repo_name, parse_result in repo_parse_results:
+        symbol_file_map: dict[str, str] = {
+            sym.scip_symbol: sym.file_path for sym in parse_result.symbols
+        }
+        symbol_kind_map: dict[str, int] = {
+            sym.scip_symbol: sym.kind for sym in parse_result.symbols
+        }
+        stub_nodes: list[GraphNode] = []
+        nodes = _build_nodes_from_symbols(
+            parse_result.symbols,
+            repo_name,
+            symbol_file_map=symbol_file_map,
+            workspace_catalog=workspace_catalog,
+        )
+        rel_edges = _build_edges_from_relationships(
+            parse_result.symbols,
+            repo_name,
+            stub_nodes,
+            symbol_file_map,
+            symbol_kind_map,
+            workspace_catalog=workspace_catalog,
+        )
+        ref_edges = _build_edges_from_references(
+            parse_result.references,
+            repo_name,
+            stub_nodes,
+            symbol_file_map,
+            symbol_kind_map,
+            workspace_catalog=workspace_catalog,
+        )
+        all_nodes_raw.extend(nodes)
+        all_nodes_raw.extend(stub_nodes)
+        all_edges_raw.extend(rel_edges)
+        all_edges_raw.extend(ref_edges)
+
+    all_nodes = _dedupe_nodes(all_nodes_raw)
+    deduped_edges = _dedupe_edges(all_edges_raw)
+    all_edges = _validate_edges(deduped_edges)
+    dropped_edge_counts = getattr(_validate_edges, "last_dropped_counts", {})
+    stats.nodes_prepared = len(all_nodes_raw)
+    stats.nodes_deduped = len(all_nodes)
+    stats.edges_prepared = len(all_edges_raw)
+    stats.edges_deduped = len(deduped_edges)
+    for reason, count in dropped_edge_counts.items():
+        stats.add_dropped_edge_reason(reason, count)
+
+    _merge_nodes(driver, all_nodes, batch_size, stats, fallback_ingestion_repo="workspace")
+    _merge_edges(driver, all_edges, batch_size, stats)
+    _merge_defined_in_edges(driver, all_nodes, batch_size, stats)
+
+    logger.info(
+        "Workspace graph ingestion complete: repos=%d, conflicts=%d, stats=%s",
+        len(repo_parse_results),
+        len(workspace_catalog.conflicts),
+        stats,
+    )
     return stats
 
 

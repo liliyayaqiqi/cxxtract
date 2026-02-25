@@ -27,7 +27,13 @@ from graphrag.neo4j_loader import (
     init_graph_schema,
     clear_repo_graph,
     ingest_graph,
+    ingest_workspace_graph,
     IngestionStats as GraphIngestionStats,
+)
+from graphrag.workspace_catalog import (
+    WorkspaceSymbolCatalog,
+    SymbolConflict,
+    build_workspace_symbol_catalog,
 )
 from graphrag.query import (
     calculate_blast_radius,
@@ -57,7 +63,11 @@ __all__ = [
     "clear_repo_graph",
     # Graph Ingestion
     "ingest_graph",
+    "ingest_workspace_graph",
     "GraphIngestionStats",
+    "WorkspaceSymbolCatalog",
+    "SymbolConflict",
+    "build_workspace_symbol_catalog",
     # Queries
     "calculate_blast_radius",
     "get_entity_neighbors",

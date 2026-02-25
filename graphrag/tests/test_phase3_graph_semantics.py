@@ -17,6 +17,7 @@ from graphrag.neo4j_loader import (
 )
 from graphrag.proto import scip_pb2
 from graphrag.scip_parser import ScipRelationship, ScipSymbolDef
+from graphrag.workspace_catalog import WorkspaceSymbolCatalog
 
 
 class TestPhase3ImplementationEdgeTyping(unittest.TestCase):
@@ -86,10 +87,59 @@ class TestPhase3StubAndDedup(unittest.TestCase):
 
         self.assertEqual(len(edges), 1)
         self.assertEqual(edges[0].relationship_type, "INHERITS")
+        self.assertTrue(edges[0].is_cross_repo)
         self.assertEqual(len(stub_nodes), 1)
         self.assertTrue(stub_nodes[0].is_external)
         self.assertEqual(stub_nodes[0].file_path, "<external>")
         self.assertEqual(stub_nodes[0].global_uri, edges[0].tgt_uri)
+
+    def test_workspace_catalog_is_primary_owner_source(self) -> None:
+        src_symbol = "cxx . . $ YAML/Widget#"
+        target_symbol = "cxx . . $ webrtc/RtpSender#"
+        symbols = [
+            ScipSymbolDef(
+                scip_symbol=src_symbol,
+                file_path="src/widget.h",
+                kind=scip_pb2.SymbolInformation.Kind.Class,
+                display_name="Widget",
+                relationships=[
+                    ScipRelationship(
+                        target_symbol=target_symbol,
+                        is_reference=False,
+                        is_implementation=True,
+                        is_type_definition=False,
+                        is_definition=False,
+                    )
+                ],
+            )
+        ]
+        catalog = WorkspaceSymbolCatalog(
+            symbol_owner_repo={target_symbol: "repo-b"},
+            symbol_owner_file={("repo-b", target_symbol): "api/rtp_sender.h"},
+        )
+
+        with patch.dict(
+            "graphrag.symbol_mapper.MONITORED_NAMESPACE_OWNER_REPOS",
+            {"webrtc": "repo-c"},
+            clear=True,
+        ):
+            stub_nodes: list[GraphNode] = []
+            edges = _build_edges_from_relationships(
+                symbols=symbols,
+                repo_name="repo-a",
+                stub_nodes=stub_nodes,
+                symbol_file_map={src_symbol: "src/widget.h"},
+                symbol_kind_map={
+                    src_symbol: scip_pb2.SymbolInformation.Kind.Class,
+                    target_symbol: scip_pb2.SymbolInformation.Kind.Class,
+                },
+                workspace_catalog=catalog,
+            )
+
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0].tgt_owner_repo, "repo-b")
+        self.assertTrue(edges[0].is_cross_repo)
+        self.assertEqual(len(stub_nodes), 0)
 
     def test_overloaded_function_symbols_do_not_merge_by_uri(self) -> None:
         symbols = [
