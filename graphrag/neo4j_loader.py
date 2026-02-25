@@ -675,7 +675,10 @@ def _build_edges_from_relationships(
                             tgt_owner_repo=tgt_repo_name,
                             tgt_scip_symbol=rel.target_symbol,
                             relationship_type=rel_type,
-                            is_cross_repo=(src_repo_name != tgt_repo_name),
+                            is_cross_repo=(
+                                src_repo_name != tgt_repo_name
+                                or tgt_disposition == "stub"
+                            ),
                         )
                     )
             
@@ -697,7 +700,10 @@ def _build_edges_from_relationships(
                         tgt_owner_repo=tgt_repo_name,
                         tgt_scip_symbol=rel.target_symbol,
                         relationship_type="USES_TYPE",
-                        is_cross_repo=(src_repo_name != tgt_repo_name),
+                        is_cross_repo=(
+                            src_repo_name != tgt_repo_name
+                            or tgt_disposition == "stub"
+                        ),
                     )
                 )
     
@@ -894,7 +900,10 @@ def _build_edges_from_references(
                 tgt_owner_repo=tgt_repo_name,
                 tgt_scip_symbol=ref.scip_symbol,
                 relationship_type=rel_type,
-                is_cross_repo=(src_owner_repo != tgt_repo_name),
+                is_cross_repo=(
+                    src_owner_repo != tgt_repo_name
+                    or tgt_disposition == "stub"
+                ),
             )
         )
     
