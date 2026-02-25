@@ -59,6 +59,7 @@ logs/
 # Environment variables
 .env
 .env.local
+workspace_manifest.yml
 
 # Temporary files
 *.tmp

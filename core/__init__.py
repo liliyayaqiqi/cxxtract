@@ -23,6 +23,18 @@ from core.startup_config import (
     validate_startup_config,
 )
 from core.run_artifacts import write_run_report
+from core.workspace_manifest import (
+    CompdbSpec,
+    RepoSpec,
+    WorkspaceManifest,
+    load_workspace_manifest,
+    resolve_compdb_path,
+)
+from core.git_source import (
+    RepoCheckoutResult,
+    checkout_ref,
+    sync_repo,
+)
 
 __all__ = [
     "GLOBAL_URI_SEPARATOR",
@@ -42,4 +54,12 @@ __all__ = [
     "resolve_strict_config_validation",
     "validate_startup_config",
     "write_run_report",
+    "CompdbSpec",
+    "RepoSpec",
+    "WorkspaceManifest",
+    "load_workspace_manifest",
+    "resolve_compdb_path",
+    "RepoCheckoutResult",
+    "checkout_ref",
+    "sync_repo",
 ]

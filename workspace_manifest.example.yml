@@ -1,0 +1,47 @@
+workspace_name: demo-workspace
+
+# Local cache directory where repos will be cloned/fetched.
+repo_cache_dir: output/workspace_repos
+
+# Directory for generated SCIP indexes.
+index_dir: output/workspace_scip
+
+# Directory for extracted entities JSONL artifacts.
+entities_dir: output/workspace_entities
+
+qdrant:
+  # Recreate collection once at workspace run start.
+  recreate_collection: false
+  # Optional override (defaults to code_embeddings).
+  collection_name: code_embeddings
+
+neo4j:
+  # Clear graph nodes for configured repos before ingesting.
+  recreate_graph: false
+
+repos:
+  - repo_name: repo_a
+    git_url: https://gitlab.example.com/group/repo-a.git
+    # Supports branch/tag/SHA.
+    ref: main
+    # Env var that stores access token for this repo.
+    token_env: GITLAB_TOKEN_A
+    # Optional subdir under checkout root for extraction/scip project root.
+    source_subdir: .
+    enabled: true
+    run_vector: true
+    run_graph: true
+    compdb_paths:
+      # Relative paths are resolved from the checked-out repo root.
+      - build/compile_commands.json
+
+  - repo_name: repo_b
+    git_url: https://gitlab.example.com/group/repo-b.git
+    ref: release/1.2
+    token_env: GITLAB_TOKEN_B
+    enabled: true
+    run_vector: true
+    run_graph: true
+    compdb_paths:
+      # Absolute paths are also supported.
+      - /abs/path/to/repo-b/compile_commands.json

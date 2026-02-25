@@ -14,12 +14,32 @@ from graphrag.config import SCIP_CLANG_PATH, DEFAULT_INDEX_OUTPUT
 
 logger = logging.getLogger(__name__)
 
+_COMMON_BUILD_DIR_NAMES = {
+    "build",
+    "cmake-build-debug",
+    "cmake-build-release",
+    "cmake-build-relwithdebinfo",
+    "cmake-build-minsizerel",
+    "out",
+}
+
+
+def _infer_project_root_from_compdb(compdb_path: str) -> str:
+    """Infer project root from compile_commands.json path."""
+    compdb_abs = os.path.abspath(compdb_path)
+    compdb_dir = os.path.dirname(compdb_abs)
+    parent_name = os.path.basename(compdb_dir)
+    if parent_name in _COMMON_BUILD_DIR_NAMES:
+        return os.path.dirname(compdb_dir)
+    return compdb_dir
+
 
 def run_scip_clang(
     compdb_path: str,
     index_output_path: str = DEFAULT_INDEX_OUTPUT,
     jobs: Optional[int] = None,
     log_level: str = "info",
+    project_root: Optional[str] = None,
 ) -> str:
     """Invoke scip-clang to generate a SCIP index from compile_commands.json.
     
@@ -28,6 +48,8 @@ def run_scip_clang(
         index_output_path: Output path for the .scip index file.
         jobs: Number of parallel indexing processes (default: CPU count).
         log_level: SCIP log level (debug, info, warning, error).
+        project_root: Working directory for scip-clang. If None, defaults
+            to the directory containing compile_commands.json.
         
     Returns:
         Absolute path to the generated .scip index file.
@@ -66,8 +88,9 @@ def run_scip_clang(
     )
     logger.debug(f"Full command: {' '.join(cmd)}")
 
-    # NEW: Deduce the project root (assuming compdb is in build/)
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(compdb_path)))
+    if project_root is None:
+        project_root = _infer_project_root_from_compdb(compdb_path)
+    project_root = os.path.abspath(project_root)
     
     try:
         result = subprocess.run(
@@ -75,7 +98,7 @@ def run_scip_clang(
             check=True,
             capture_output=True,
             text=True,
-            cwd=project_root,  # Run from project root for better relative paths
+            cwd=project_root,
         )
         
         # Log scip-clang output
