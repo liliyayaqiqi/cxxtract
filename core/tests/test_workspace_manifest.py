@@ -35,6 +35,7 @@ repos:
             self.assertEqual(manifest.workspace_name, "demo")
             self.assertEqual(len(manifest.repos), 1)
             self.assertEqual(manifest.repos[0].repo_name, "repo-a")
+            self.assertEqual(manifest.compdb_root_dir, "output/workspace_compdb")
             self.assertEqual(manifest.repos[0].compdb_paths[0].path, "build/compile_commands.json")
         finally:
             Path(path).unlink(missing_ok=True)
@@ -98,9 +99,9 @@ repos:
             Path(path).unlink(missing_ok=True)
 
     def test_resolve_relative_compdb(self) -> None:
-        repo_root = Path("/tmp/work/repo-a")
-        resolved = resolve_compdb_path(repo_root, CompdbSpec(path="build/compile_commands.json"))
-        self.assertEqual(str(resolved), "/tmp/work/repo-a/build/compile_commands.json")
+        compdb_root = Path("/tmp/work/compdb")
+        resolved = resolve_compdb_path(compdb_root, CompdbSpec(path="repo-a/build/compile_commands.json"))
+        self.assertEqual(str(resolved), "/tmp/work/compdb/repo-a/build/compile_commands.json")
 
 
 if __name__ == "__main__":

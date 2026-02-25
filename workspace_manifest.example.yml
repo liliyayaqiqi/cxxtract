@@ -3,6 +3,10 @@ workspace_name: demo-workspace
 # Local cache directory where repos will be cloned/fetched.
 repo_cache_dir: output/workspace_repos
 
+# Root directory for downloaded compile_commands.json artifacts.
+# Relative compdb_paths below are resolved from this directory.
+compdb_root_dir: output/workspace_compdb
+
 # Directory for generated SCIP indexes.
 index_dir: output/workspace_scip
 
@@ -32,8 +36,8 @@ repos:
     run_vector: true
     run_graph: true
     compdb_paths:
-      # Relative paths are resolved from the checked-out repo root.
-      - build/compile_commands.json
+      # Relative paths are resolved from compdb_root_dir, not repo checkout dir.
+      - repo_a/build/compile_commands.json
 
   - repo_name: repo_b
     git_url: https://gitlab.example.com/group/repo-b.git

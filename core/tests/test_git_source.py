@@ -16,8 +16,8 @@ class TestGitSource(unittest.TestCase):
     def test_checkout_ref_returns_commit(self) -> None:
         calls: list[list[str]] = []
 
-        def _fake_run(cmd, cwd=None, check=None, text=None, capture_output=None):  # noqa: ANN001
-            del cwd, check, text, capture_output
+        def _fake_run(cmd, cwd=None, check=None, text=None, capture_output=None, timeout=None, env=None, stdin=None):  # noqa: ANN001
+            del cwd, check, text, capture_output, timeout, env, stdin
             calls.append(cmd)
 
             class _Result:
@@ -59,8 +59,8 @@ class TestGitSource(unittest.TestCase):
             repo_dir.mkdir(parents=True, exist_ok=True)
             (repo_dir / ".git").mkdir(parents=True, exist_ok=True)
 
-            def _fake_run(cmd, cwd=None, check=None, text=None, capture_output=None):  # noqa: ANN001
-                del cwd, check, text, capture_output
+            def _fake_run(cmd, cwd=None, check=None, text=None, capture_output=None, timeout=None, env=None, stdin=None):  # noqa: ANN001
+                del cwd, check, text, capture_output, timeout, env, stdin
 
                 class _Result:
                     stdout = "deadbeef\n" if "rev-parse" in cmd else ""

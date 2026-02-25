@@ -121,6 +121,12 @@ def parse_args() -> argparse.Namespace:
 def _write_entities_jsonl(source_root: Path, repo_root: Path, repo_name: str, out_file: Path) -> int:
     out_file.parent.mkdir(parents=True, exist_ok=True)
     line_count = 0
+    logger.info(
+        "Starting extraction for repo=%s source_root=%s output=%s",
+        repo_name,
+        source_root,
+        out_file,
+    )
     with out_file.open("w", encoding="utf-8") as f:
         for entity in iter_extract_to_dict_list(
             source=str(source_root),
@@ -130,6 +136,17 @@ def _write_entities_jsonl(source_root: Path, repo_root: Path, repo_name: str, ou
         ):
             f.write(json.dumps(entity, ensure_ascii=False) + "\n")
             line_count += 1
+            if line_count % 1000 == 0:
+                logger.info(
+                    "Extraction progress: repo=%s entities_serialized=%d",
+                    repo_name,
+                    line_count,
+                )
+    logger.info(
+        "Extraction completed: repo=%s entities_serialized=%d",
+        repo_name,
+        line_count,
+    )
     return line_count
 
 
@@ -143,6 +160,7 @@ def _process_repo(
     qdrant_collection: str,
 ) -> tuple[dict[str, Any], Optional[ScipParseResult]]:
     """Process one repository and return report + optional graph parse result."""
+    logger.info("Processing repo start: %s", spec.repo_name)
     repo_report: dict[str, Any] = {
         "repo_name": spec.repo_name,
         "status": "failed",
@@ -165,10 +183,18 @@ def _process_repo(
     repo_report["checkout"] = {
         "repo_dir": str(repo_dir),
         "source_root": str(source_root),
+        "compdb_root_dir": str(Path(manifest.compdb_root_dir).resolve()),
         "ref": checkout.ref,
         "commit_sha": checkout.commit_sha,
         "cloned": checkout.cloned,
     }
+    logger.info(
+        "Repo checkout ready: repo=%s ref=%s commit=%s source_root=%s",
+        spec.repo_name,
+        checkout.ref,
+        checkout.commit_sha,
+        source_root,
+    )
 
     if spec.run_vector:
         entities_file = Path(manifest.entities_dir).resolve() / f"{spec.repo_name}.jsonl"
@@ -184,30 +210,50 @@ def _process_repo(
             "entities_serialized": lines,
         }
         if lines > 0:
+            logger.info(
+                "Starting Qdrant ingest: repo=%s entities=%d collection=%s",
+                spec.repo_name,
+                lines,
+                qdrant_collection,
+            )
             with phase_scope(f"{spec.repo_name}_qdrant_ingest"):
                 stats = ingest_from_jsonl(
                     file_path=str(entities_file),
                     client=qdrant_client,
                     collection_name=qdrant_collection,
                 )
+            logger.info(
+                "Qdrant ingest completed: repo=%s uploaded=%d attempted=%d",
+                spec.repo_name,
+                stats.points_uploaded,
+                stats.points_attempted,
+            )
             repo_report["vector"]["qdrant"] = stats.to_slo_report()
         else:
             repo_report["vector"]["qdrant"] = {"status": "skipped_no_entities"}
 
     parse_result: Optional[ScipParseResult] = None
     if spec.run_graph:
+        logger.info("Starting graph indexing/parsing: repo=%s", spec.repo_name)
         parse_results: list[ScipParseResult] = []
         index_root = Path(manifest.index_dir).resolve() / spec.repo_name
         index_root.mkdir(parents=True, exist_ok=True)
+        compdb_root_dir = Path(manifest.compdb_root_dir).resolve()
         compdb_reports: list[dict[str, Any]] = []
         for idx, compdb in enumerate(spec.compdb_paths):
-            compdb_path = resolve_compdb_path(repo_dir, compdb).resolve()
+            compdb_path = resolve_compdb_path(compdb_root_dir, compdb).resolve()
             if not compdb_path.is_file():
                 raise FileNotFoundError(
                     f"compile_commands.json not found for repo '{spec.repo_name}': {compdb_path}"
                 )
             index_path = index_root / f"index_{idx}.scip"
             with phase_scope(f"{spec.repo_name}_scip_index_{idx}"):
+                logger.info(
+                    "Running scip-clang: repo=%s compdb=%s index_out=%s",
+                    spec.repo_name,
+                    compdb_path,
+                    index_path,
+                )
                 generated = run_scip_clang(
                     compdb_path=str(compdb_path),
                     index_output_path=str(index_path),
@@ -215,6 +261,7 @@ def _process_repo(
                     project_root=str(source_root),
                 )
             with phase_scope(f"{spec.repo_name}_scip_parse_{idx}"):
+                logger.info("Parsing SCIP index: repo=%s index=%s", spec.repo_name, generated)
                 parsed = parse_scip_index(generated, spec.repo_name)
             parse_results.append(parsed)
             compdb_reports.append(
@@ -231,8 +278,15 @@ def _process_repo(
             "merged_symbol_count": len(parse_result.symbols),
             "merged_reference_count": len(parse_result.references),
         }
+        logger.info(
+            "Graph parse merged: repo=%s symbols=%d references=%d",
+            spec.repo_name,
+            len(parse_result.symbols),
+            len(parse_result.references),
+        )
 
     repo_report["status"] = "success"
+    logger.info("Processing repo complete: %s", spec.repo_name)
     return repo_report, parse_result
 
 
@@ -281,6 +335,7 @@ def execute_workspace_pipeline(
     graph_inputs: list[tuple[str, ScipParseResult]] = []
     for spec in enabled_repos:
         try:
+            logger.info("Workspace loop entering repo=%s", spec.repo_name)
             repo_report, parse_result = _process_repo(
                 spec=spec,
                 manifest=manifest,
@@ -306,6 +361,7 @@ def execute_workspace_pipeline(
                 break
 
     if graph_inputs and neo4j_driver is not None:
+        logger.info("Starting workspace graph ingest for repos=%d", len(graph_inputs))
         with phase_scope("workspace_graph_ingest"):
             catalog = build_workspace_symbol_catalog(graph_inputs)
             graph_stats = ingest_workspace_graph(

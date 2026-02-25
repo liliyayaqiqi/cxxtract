@@ -54,6 +54,7 @@ class WorkspaceManifest:
     workspace_name: str
     repos: list[RepoSpec]
     repo_cache_dir: str = "output/workspace_repos"
+    compdb_root_dir: str = "output/workspace_compdb"
     index_dir: str = "output/workspace_scip"
     entities_dir: str = "output/workspace_entities"
     qdrant: QdrantWorkspaceConfig = field(default_factory=QdrantWorkspaceConfig)
@@ -151,6 +152,7 @@ def load_workspace_manifest(path: str) -> WorkspaceManifest:
         workspace_name=workspace_name,
         repos=repos,
         repo_cache_dir=str(payload.get("repo_cache_dir", "output/workspace_repos")),
+        compdb_root_dir=str(payload.get("compdb_root_dir", "output/workspace_compdb")),
         index_dir=str(payload.get("index_dir", "output/workspace_scip")),
         entities_dir=str(payload.get("entities_dir", "output/workspace_entities")),
         qdrant=QdrantWorkspaceConfig(
@@ -167,7 +169,7 @@ def load_workspace_manifest(path: str) -> WorkspaceManifest:
     )
 
 
-def resolve_compdb_path(repo_checkout_dir: Path, compdb: CompdbSpec) -> Path:
-    """Resolve compdb path relative to checkout root if needed."""
+def resolve_compdb_path(compdb_root_dir: Path, compdb: CompdbSpec) -> Path:
+    """Resolve compdb path relative to configured compdb root if needed."""
     raw = Path(compdb.path)
-    return raw if raw.is_absolute() else (repo_checkout_dir / raw)
+    return raw if raw.is_absolute() else (compdb_root_dir / raw)
